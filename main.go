@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -18,11 +19,20 @@ func main() {
 	passwordFlag := flag.String("password", "codex", "login password for codex-web")
 	flag.Parse()
 
+	workdir, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("detect app workdir: %v", err)
+	}
+	defaultWorkdir = filepath.Clean(workdir)
+
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatalf("create data dir: %v", err)
 	}
 	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
 		log.Fatalf("create upload dir: %v", err)
+	}
+	if err := ensureCodexHome(); err != nil {
+		log.Fatalf("prepare codex home: %v", err)
 	}
 	if err := ensureCodexAvailable(); err != nil {
 		log.Fatalf("%v; also make sure `codex login` has been completed on this machine", err)

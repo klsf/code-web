@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -15,6 +16,50 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func defaultCodexHome() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(home) == "" {
+		return "", errors.New("user home directory is empty")
+	}
+	return filepath.Join(home, ".codex"), nil
+}
+
+func codexHomeDir() string {
+	if value := strings.TrimSpace(os.Getenv("CODEX_HOME")); value != "" {
+		return filepath.Clean(value)
+	}
+	path, err := defaultCodexHome()
+	if err != nil {
+		return filepath.Join(os.Getenv("HOME"), ".codex")
+	}
+	return path
+}
+
+func ensureCodexHome() error {
+	current := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if current != "" {
+		info, err := os.Stat(current)
+		if err == nil && info.IsDir() {
+			return nil
+		}
+	}
+
+	fallback, err := defaultCodexHome()
+	if err != nil {
+		return fmt.Errorf("resolve codex home: %w", err)
+	}
+	if err := os.MkdirAll(fallback, 0o755); err != nil {
+		return fmt.Errorf("create codex home: %w", err)
+	}
+	if current != "" && filepath.Clean(current) != fallback {
+		log.Printf("invalid CODEX_HOME %q; using %q instead", current, fallback)
+	}
+	return os.Setenv("CODEX_HOME", fallback)
+}
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -68,7 +113,7 @@ func resolveImageFiles(imageIDs []string) ([]string, []string, error) {
 }
 
 func detectCodexModel() string {
-	raw, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), ".codex", "config.toml"))
+	raw, err := os.ReadFile(filepath.Join(codexHomeDir(), "config.toml"))
 	if err != nil {
 		return "unknown"
 	}
@@ -107,7 +152,7 @@ func ensureCodexAvailable() error {
 }
 
 func listInstalledSkills() ([]skillInfo, error) {
-	root := filepath.Join(os.Getenv("HOME"), ".codex", "skills")
+	root := filepath.Join(codexHomeDir(), "skills")
 	items := make([]skillInfo, 0, 16)
 	seen := make(map[string]bool)
 
@@ -730,7 +775,7 @@ func stepSummaryText(event EventLog) string {
 }
 
 func detectServiceTier() string {
-	raw, err := os.ReadFile(filepath.Join(os.Getenv("HOME"), ".codex", "config.toml"))
+	raw, err := os.ReadFile(filepath.Join(codexHomeDir(), "config.toml"))
 	if err != nil {
 		return ""
 	}

@@ -18,13 +18,14 @@ const (
 	addr                = "0.0.0.0:991"
 	dataDir             = "data/sessions"
 	uploadsDir          = "data/uploads"
-	defaultWorkdir      = "/www/codex"
 	appServerURL        = "ws://127.0.0.1:8765"
 	appServerInitWait   = 15 * time.Second
 	appServerRPCTimeout = 30 * time.Second
 	authCookieName      = "codex_web_auth"
 	appVersion          = "1.0.4"
 )
+
+var defaultWorkdir = "."
 
 //go:embed static
 var embeddedStatic embed.FS

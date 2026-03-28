@@ -167,6 +167,15 @@ func (s *sessionStore) handleCodexAuthComplete(w http.ResponseWriter, r *http.Re
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if loggedIn, _ := codexLoginStatus(); loggedIn {
+			if s.app != nil {
+				s.resetSessionThreads()
+				restartErr := s.app.Restart(ctx, "Codex 登录账号已切换，当前任务已中断")
+				if restartErr != nil {
+					log.Printf("auth complete restart failed: session=%s error=%v", current.ID, restartErr)
+					writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "codex app-server restart failed"})
+					return
+				}
+			}
 			log.Printf("auth complete confirmed: session=%s", current.ID)
 			writeJSON(w, s.auth.Status(false))
 			return

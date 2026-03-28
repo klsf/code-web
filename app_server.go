@@ -45,6 +45,9 @@ func (c *appServerClient) Close() {
 	c.conn = nil
 	c.proc = nil
 	c.initialized = false
+	c.pending = make(map[string]chan rpcPacket)
+	c.threadTurn = make(map[string]string)
+	c.loadedThreads = make(map[string]bool)
 	c.mu.Unlock()
 
 	if conn != nil {
@@ -54,6 +57,44 @@ func (c *appServerClient) Close() {
 		_ = proc.Process.Kill()
 		_, _ = proc.Process.Wait()
 	}
+}
+
+func (c *appServerClient) Restart(ctx context.Context, taskFailureMessage string) error {
+	c.mu.Lock()
+	conn := c.conn
+	proc := c.proc
+	pending := c.pending
+	c.conn = nil
+	c.proc = nil
+	c.initialized = false
+	c.pending = make(map[string]chan rpcPacket)
+	c.threadTurn = make(map[string]string)
+	c.loadedThreads = make(map[string]bool)
+	c.mu.Unlock()
+
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if proc != nil && proc.Process != nil {
+		_ = proc.Process.Kill()
+		_, _ = proc.Process.Wait()
+	}
+
+	for id, ch := range pending {
+		ch <- rpcPacket{
+			ID: mustMarshalJSON(id),
+			Error: &rpcError{
+				Code:    -32000,
+				Message: "codex app-server restarted",
+			},
+		}
+	}
+
+	if strings.TrimSpace(taskFailureMessage) != "" {
+		c.store.failAllActiveTasks(taskFailureMessage)
+	}
+
+	return c.ensureConnected(ctx)
 }
 
 func (c *appServerClient) ensureConnected(ctx context.Context) error {
