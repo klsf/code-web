@@ -24,6 +24,9 @@ func main() {
 	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
 		log.Fatalf("create upload dir: %v", err)
 	}
+	if err := ensureCodexAvailable(); err != nil {
+		log.Fatalf("%v; also make sure `codex login` has been completed on this machine", err)
+	}
 
 	store := &sessionStore{
 		sessions: make(map[string]*sessionRuntime),
@@ -63,6 +66,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(staticFS)))
 	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadsDir))))
+	mux.HandleFunc("/app-config.js", store.handleAppConfig)
 	mux.HandleFunc("/ws", store.handleWS)
 	mux.HandleFunc("/api/login", store.handleLogin)
 	mux.HandleFunc("/api/auth", store.handleAuth)

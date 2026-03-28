@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -89,6 +90,20 @@ func detectCodexModel() string {
 	}
 
 	return "unknown"
+}
+
+func ensureCodexAvailable() error {
+	path, err := exec.LookPath("codex")
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			return errors.New("codex executable not found in PATH; install Codex CLI and ensure `codex.exe` (or its shim) is available in PATH before starting codex-web")
+		}
+		return errors.New("codex executable not found in PATH; install Codex CLI and ensure `codex` is available in PATH before starting codex-web")
+	}
+	if strings.TrimSpace(path) == "" {
+		return errors.New("codex executable path is empty")
+	}
+	return nil
 }
 
 func listInstalledSkills() ([]skillInfo, error) {
@@ -212,6 +227,11 @@ func mustMarshalJSON(v interface{}) json.RawMessage {
 	return raw
 }
 
+func mustJSObject(v interface{}) string {
+	raw, _ := json.Marshal(v)
+	return string(raw)
+}
+
 func stringField(m map[string]interface{}, keys ...string) string {
 	for _, key := range keys {
 		if value, ok := m[key]; ok {
@@ -240,7 +260,10 @@ func intField(m map[string]interface{}, keys ...string) (int, bool) {
 }
 
 func normalizeItemType(value string) string {
-	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), "-", ""))
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "-", "")
+	value = strings.ReplaceAll(value, " ", "")
+	return value
 }
 
 func firstNonEmpty(values ...string) string {
@@ -250,6 +273,14 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstLine(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return strings.TrimSpace(strings.Split(value, "\n")[0])
 }
 
 func extractAppServerErrorMessage(raw json.RawMessage, payload notificationEnvelope) string {
@@ -290,6 +321,412 @@ func lookupNestedString(data map[string]interface{}, path string) string {
 		return text
 	}
 	return ""
+}
+
+func itemField(item map[string]interface{}, paths ...string) string {
+	for _, path := range paths {
+		if text := strings.TrimSpace(lookupNestedString(item, path)); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func itemPath(item map[string]interface{}) string {
+	return itemField(
+		item,
+		"relativePath",
+		"relative_path",
+		"path",
+		"filePath",
+		"file_path",
+		"filepath",
+		"targetPath",
+		"target_path",
+		"target",
+		"args.relativePath",
+		"args.relative_path",
+		"args.path",
+		"args.filePath",
+		"args.file_path",
+		"args.targetPath",
+		"args.target_path",
+		"args.target",
+		"arguments.relativePath",
+		"arguments.relative_path",
+		"arguments.path",
+		"arguments.filePath",
+		"arguments.file_path",
+		"arguments.targetPath",
+		"arguments.target_path",
+		"arguments.target",
+		"input.relativePath",
+		"input.relative_path",
+		"input.path",
+		"input.filePath",
+		"input.file_path",
+		"input.targetPath",
+		"input.target_path",
+		"input.target",
+	)
+}
+
+func nestedValue(data map[string]interface{}, path string) interface{} {
+	current := interface{}(data)
+	for _, part := range strings.Split(path, ".") {
+		node, ok := current.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		current, ok = node[part]
+		if !ok {
+			return nil
+		}
+	}
+	return current
+}
+
+func stringsFromValue(value interface{}) []string {
+	switch v := value.(type) {
+	case string:
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return nil
+		}
+		return []string{text}
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			switch node := item.(type) {
+			case string:
+				text := strings.TrimSpace(node)
+				if text != "" {
+					out = append(out, text)
+				}
+			case map[string]interface{}:
+				if path := itemPath(node); path != "" {
+					out = append(out, path)
+					continue
+				}
+				if path := itemField(node, "oldPath", "old_path", "newPath", "new_path"); path != "" {
+					out = append(out, path)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func countFromValue(value interface{}) int {
+	switch v := value.(type) {
+	case []interface{}:
+		return len(v)
+	case map[string]interface{}:
+		return len(v)
+	default:
+		return 0
+	}
+}
+
+func summarizeWebSearch(item map[string]interface{}) string {
+	query := itemField(item, "query", "args.query", "arguments.query", "input.query")
+	if query == "" {
+		query = itemField(item, "pattern", "args.pattern", "arguments.pattern", "input.pattern")
+	}
+	domains := stringsFromValue(nestedValue(item, "domains"))
+	if len(domains) == 0 {
+		domains = stringsFromValue(nestedValue(item, "args.domains"))
+	}
+	if len(domains) == 0 {
+		domains = stringsFromValue(nestedValue(item, "arguments.domains"))
+	}
+	if len(domains) == 0 {
+		domains = stringsFromValue(nestedValue(item, "input.domains"))
+	}
+
+	resultsCount := 0
+	for _, key := range []string{"results", "items", "hits", "matches", "output.results", "output.items"} {
+		if count := countFromValue(nestedValue(item, key)); count > 0 {
+			resultsCount = count
+			break
+		}
+	}
+
+	parts := make([]string, 0, 3)
+	if query != "" {
+		parts = append(parts, query)
+	}
+	if len(domains) > 0 {
+		label := strings.Join(domains[:minInt(len(domains), 2)], ", ")
+		if len(domains) > 2 {
+			label += fmt.Sprintf(" +%d", len(domains)-2)
+		}
+		parts = append(parts, "domains: "+label)
+	}
+	if resultsCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d results", resultsCount))
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, " · ")
+	}
+	if url := itemField(item, "url", "uri", "args.url", "arguments.url", "input.url"); url != "" {
+		return url
+	}
+	return ""
+}
+
+func summarizeFileChange(item map[string]interface{}) string {
+	action := itemField(
+		item,
+		"changeType",
+		"change_type",
+		"action",
+		"type",
+		"args.changeType",
+		"args.change_type",
+		"args.action",
+		"arguments.changeType",
+		"arguments.change_type",
+		"arguments.action",
+		"input.changeType",
+		"input.change_type",
+		"input.action",
+	)
+	oldPath := itemField(item, "oldPath", "old_path", "args.oldPath", "args.old_path", "arguments.oldPath", "arguments.old_path", "input.oldPath", "input.old_path")
+	newPath := itemField(item, "newPath", "new_path", "args.newPath", "args.new_path", "arguments.newPath", "arguments.new_path", "input.newPath", "input.new_path")
+	path := itemPath(item)
+
+	switch {
+	case oldPath != "" && newPath != "" && oldPath != newPath:
+		if action != "" {
+			return fmt.Sprintf("%s: %s -> %s", action, oldPath, newPath)
+		}
+		return oldPath + " -> " + newPath
+	case path != "":
+		if action != "" {
+			return action + ": " + path
+		}
+		return path
+	}
+
+	for _, key := range []string{
+		"changes",
+		"files",
+		"targets",
+		"items",
+		"args.changes",
+		"args.files",
+		"arguments.changes",
+		"arguments.files",
+		"input.changes",
+		"input.files",
+	} {
+		paths := stringsFromValue(nestedValue(item, key))
+		if len(paths) == 0 {
+			continue
+		}
+		if len(paths) == 1 {
+			if action != "" {
+				return action + ": " + paths[0]
+			}
+			return paths[0]
+		}
+		preview := strings.Join(paths[:minInt(len(paths), 3)], ", ")
+		if len(paths) > 3 {
+			preview += fmt.Sprintf(" +%d more", len(paths)-3)
+		}
+		if action != "" {
+			return fmt.Sprintf("%s: %s", action, preview)
+		}
+		return preview
+	}
+
+	return ""
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func summarizeItemDetails(itemType string, item map[string]interface{}) string {
+	if len(item) == 0 {
+		return ""
+	}
+
+	path := itemPath(item)
+	query := itemField(item, "query", "args.query", "arguments.query", "input.query")
+	pattern := itemField(item, "pattern", "args.pattern", "arguments.pattern", "input.pattern")
+	url := itemField(item, "url", "uri", "args.url", "arguments.url", "input.url")
+	command := itemField(item, "command")
+
+	switch itemType {
+	case "readfile", "read_file", "writefile", "write_file", "editfile", "edit_file", "patchfile", "patch_file", "openfile", "open_file", "viewimage", "view_image", "listdir", "list_dir", "readdir", "read_dir":
+		if path != "" {
+			return path
+		}
+	case "grep", "searchtext", "search_text":
+		if pattern != "" && path != "" {
+			return pattern + " in " + path
+		}
+		if pattern != "" {
+			return pattern
+		}
+		if query != "" && path != "" {
+			return query + " in " + path
+		}
+		if query != "" {
+			return query
+		}
+		if path != "" {
+			return path
+		}
+	case "searchfiles", "search_files", "glob", "findfiles", "find_files":
+		if pattern != "" && path != "" {
+			return pattern + " in " + path
+		}
+		if pattern != "" {
+			return pattern
+		}
+		if query != "" && path != "" {
+			return query + " in " + path
+		}
+		if query != "" {
+			return query
+		}
+		if path != "" {
+			return path
+		}
+	case "fetchurl", "fetch_url", "openurl", "open_url":
+		if url != "" {
+			return url
+		}
+	case "websearch":
+		if summary := summarizeWebSearch(item); summary != "" {
+			return summary
+		}
+	case "filechange", "file_change":
+		if summary := summarizeFileChange(item); summary != "" {
+			return summary
+		}
+	}
+
+	for _, text := range []string{path, pattern, query, url, command} {
+		if text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func itemStartedTitle(itemType string) string {
+	switch itemType {
+	case "readfile", "read_file":
+		return "read file"
+	case "writefile", "write_file":
+		return "write file"
+	case "editfile", "edit_file", "patchfile", "patch_file":
+		return "edit file"
+	case "searchfiles", "search_files", "glob", "findfiles", "find_files":
+		return "find files"
+	case "grep", "searchtext", "search_text":
+		return "search text"
+	case "openfile", "open_file", "viewimage", "view_image":
+		return "open file"
+	case "fetchurl", "fetch_url", "openurl", "open_url":
+		return "open url"
+	case "listdir", "list_dir", "readdir", "read_dir":
+		return "list directory"
+	case "websearch":
+		return "web search"
+	case "filechange", "file_change":
+		return "file change"
+	default:
+		if itemType == "" {
+			return "step started"
+		}
+		return strings.ReplaceAll(itemType, "_", " ")
+	}
+}
+
+func eventFields(kind, title, body string) (string, string, string, string, int) {
+	title = strings.TrimSpace(title)
+	body = strings.TrimSpace(body)
+	lowerTitle := strings.ToLower(title)
+
+	if kind == "command" {
+		phase := "started"
+		if strings.Contains(lowerTitle, "completed") {
+			phase = "completed"
+		}
+		if strings.Contains(lowerTitle, "failed") {
+			phase = "failed"
+		}
+		return "command", "shell_command", phase, firstLine(body), 0
+	}
+
+	if kind != "status" {
+		return "", "", "", "", 0
+	}
+
+	switch {
+	case lowerTitle == "task submitted":
+		return "task", "task", "submitted", body, 0
+	case lowerTitle == "task queued":
+		return "task", "task", "queued", body, 0
+	case lowerTitle == "task dequeued":
+		return "task", "task", "dequeued", body, 0
+	case lowerTitle == "turn started":
+		return "turn", "turn", "started", "", 0
+	case lowerTitle == "turn completed":
+		return "turn", "turn", "completed", "", 0
+	case lowerTitle == "turn interrupted":
+		return "turn", "turn", "interrupted", "", 0
+	case lowerTitle == "thread compact started":
+		return "thread", "compact", "started", "", 0
+	case lowerTitle == "review started":
+		return "review", "review", "started", "", 0
+	case body != "":
+		return "step", normalizeItemType(lowerTitle), "started", body, 0
+	default:
+		return "status", normalizeItemType(lowerTitle), "", body, 0
+	}
+}
+
+func stepSummaryText(event EventLog) string {
+	label := strings.TrimSpace(event.Title)
+	if event.StepType != "" {
+		switch normalizeItemType(event.StepType) {
+		case "readfile":
+			label = "read file"
+		case "writefile":
+			label = "write file"
+		case "editfile", "patchfile":
+			label = "edit file"
+		case "searchfiles", "glob", "findfiles":
+			label = "find files"
+		case "grep", "searchtext":
+			label = "search text"
+		case "fetchurl", "openurl":
+			label = "open url"
+		case "websearch":
+			label = "web search"
+		case "filechange":
+			label = "file change"
+		}
+	}
+	target := strings.TrimSpace(firstNonEmpty(event.Target, event.Body))
+	if label == "" {
+		return target
+	}
+	if target == "" || strings.EqualFold(target, label) {
+		return label
+	}
+	return label + ": " + target
 }
 
 func detectServiceTier() string {

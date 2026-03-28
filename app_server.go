@@ -341,7 +341,11 @@ func (c *appServerClient) handleItemStarted(payload notificationEnvelope) {
 		c.store.appendEvent(sessionID, "command", "shell command started", strings.TrimSpace(stringField(payload.Item, "command")))
 	default:
 		if itemType != "" {
-			c.store.appendEvent(sessionID, "status", "item started", itemType)
+			body := strings.TrimSpace(summarizeItemDetails(itemType, payload.Item))
+			if body == "" {
+				body = itemType
+			}
+			c.store.appendEvent(sessionID, "status", itemStartedTitle(itemType), body)
 		}
 	}
 }

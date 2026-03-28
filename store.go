@@ -643,9 +643,16 @@ func (s *sessionStore) appendEvent(sessionID, kind, title, body string) {
 		return
 	}
 
+	category, stepType, phase, target, count := eventFields(kind, title, body)
+
 	logEntry := EventLog{
 		ID:        uuid.NewString(),
 		Kind:      kind,
+		Category:  category,
+		StepType:  stepType,
+		Phase:     phase,
+		Target:    target,
+		Count:     count,
 		Title:     title,
 		Body:      body,
 		CreatedAt: time.Now(),
@@ -766,10 +773,18 @@ func (s *sessionStore) listSessions() []sessionSummary {
 			Workdir:      normalizeWorkdir(session.Workdir),
 			UpdatedAt:    session.UpdatedAt,
 			MessageCount: len(session.Messages),
+			Running:      session.ActiveTaskID != "",
 		}
 		if n := len(session.Messages); n > 0 {
 			last := strings.TrimSpace(session.Messages[n-1].Content)
 			summary.LastMessage = compactForSummary(last)
+		}
+		for i := len(session.Events) - 1; i >= 0; i-- {
+			event := session.Events[i]
+			if event.Category == "step" && strings.TrimSpace(event.Target) != "" {
+				summary.LastEvent = compactForSummary(stepSummaryText(event))
+				break
+			}
 		}
 		items = append(items, summary)
 	}

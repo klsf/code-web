@@ -260,8 +260,7 @@ async function executeCommand(item) {
     autoResize();
     scrollToBottom();
   } catch (err) {
-    footerState.textContent = "error";
-    footerDetail.textContent = err && err.message ? err.message : "命令执行失败";
+    showError(err && err.message ? err.message : "命令执行失败");
   }
 }
 

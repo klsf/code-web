@@ -77,10 +77,17 @@ func (s *sessionStore) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+func (s *sessionStore) handleAppConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	_, _ = w.Write([]byte("window.__APP_CONFIG = " + mustJSObject(map[string]string{
+		"version": strings.TrimSpace(appVersion),
+	}) + ";\n"))
+}
+
 func (s *sessionStore) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if path == "/api/login" || path == "/api/auth" || path == "/api/logout" || path == "/" || path == "/index.html" || path == "/app.js" || path == "/style.css" {
+		if path == "/api/login" || path == "/api/auth" || path == "/api/logout" || path == "/" || path == "/index.html" || path == "/app.js" || path == "/style.css" || path == "/app-config.js" {
 			next.ServeHTTP(w, r)
 			return
 		}

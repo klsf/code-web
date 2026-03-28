@@ -3,6 +3,8 @@ form.addEventListener("submit", function (evt) {
   submitPrompt();
 });
 
+applyBuildInfo();
+
 input.addEventListener("input", function () {
   autoResize();
   updateCommandPalette();
@@ -83,6 +85,7 @@ loginForm.addEventListener("submit", async function (evt) {
     await openSessionChooser();
   } catch (err) {
     loginError.textContent = err && err.message ? err.message : "登录失败";
+    showError(err && err.message ? err.message : "登录失败");
     passwordInput.select();
   }
 });
@@ -95,6 +98,7 @@ newSessionChoice.addEventListener("click", async function () {
   } catch (err) {
     resumeEmpty.hidden = false;
     resumeEmpty.textContent = err && err.message ? err.message : "新建会话失败";
+    showError(err && err.message ? err.message : "新建会话失败");
   }
 });
 
@@ -111,10 +115,25 @@ resumeSessionChoice.addEventListener("click", function () {
     var openButton = document.createElement("button");
     openButton.type = "button";
     openButton.className = "resume-open";
-    openButton.innerHTML = '<div class="resume-item-title">' + shortSession(item.id) + '</div><div class="resume-item-desc">' + resumeSummary(item) + '</div>';
+    openButton.innerHTML =
+      '<div class="resume-item-title">' +
+        shortSession(item.id) +
+        (item.running ? '<span class="resume-item-badge">running</span>' : '') +
+      '</div>' +
+      '<div class="resume-item-path">' + resumeWorkdir(item) + '</div>' +
+      '<div class="resume-item-desc">' + resumeActivity(item) + '</div>' +
+      '<div class="resume-item-meta">' + Number(item.messageCount || 0) + ' 条消息 · ' + (item.updatedAt ? formatTime(item.updatedAt) : "--:--") + '</div>';
     openButton.addEventListener("click", async function () {
-      await switchSession(item.id, false);
-      enterApp();
+      try {
+        openButton.disabled = true;
+        openButton.classList.add("is-loading");
+        await switchSession(item.id, false);
+        enterApp();
+      } catch (err) {
+        openButton.disabled = false;
+        openButton.classList.remove("is-loading");
+        showError(err && err.message ? err.message : "切换会话失败");
+      }
     });
 
     var deleteButton = document.createElement("button");
@@ -132,6 +151,7 @@ resumeSessionChoice.addEventListener("click", function () {
       if (!res.ok) {
         resumeEmpty.hidden = false;
         resumeEmpty.textContent = await res.text();
+        showError(resumeEmpty.textContent);
         return;
       }
       row.remove();

@@ -52,8 +52,7 @@ async function submitPrompt(raw) {
   } catch (err) {
     removeWorkingPlaceholder();
     setTaskState(false);
-    footerState.textContent = "error";
-    footerDetail.textContent = "发送失败";
+    showError(err && err.message ? err.message : "发送失败");
   }
 }
 
@@ -116,18 +115,19 @@ function connect() {
       return;
     }
     if (data.type === "error" && data.error) {
-      footerState.textContent = "error";
-      footerDetail.textContent = data.error;
+      showError(data.error);
     }
   });
 
   ws.addEventListener("close", function () {
     setTransportState("reconnecting");
+    showError("连接已断开，正在重连");
     reconnectTimer = setTimeout(connect, 1500);
   });
 
   ws.addEventListener("error", function () {
     setTransportState("error");
+    showError("连接异常");
   });
 }
 

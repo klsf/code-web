@@ -1,5 +1,6 @@
 function setTransportState(state) {
   transportBadge.textContent = state;
+  if (desktopTransportBadge) desktopTransportBadge.textContent = state;
   statusTransport.textContent = state;
   if (!isRunning) {
     footerState.textContent = state === "connected" ? "ready" : state;
@@ -54,7 +55,7 @@ function setTaskState(running) {
   if (running) {
     footerState.textContent = "Working";
     footerDetail.textContent = "Codex 正在执行任务，可输入 /stop 终止";
-    input.placeholder = "任务执行中，输入 /stop 终止";
+    input.placeholder = "发送消息...";
     scheduleStatusRefresh(0);
     return;
   }
@@ -68,6 +69,7 @@ function setSession(id) {
   currentSessionId = id;
   localStorage.setItem("codex_session_id", id);
   sessionBadge.textContent = id.slice(0, 8);
+  if (desktopSessionBadge) desktopSessionBadge.textContent = id.slice(0, 8);
   statusSession.textContent = shortSession(id);
   scheduleStatusRefresh(0);
 }
@@ -118,6 +120,33 @@ function addPendingImageFiles(files) {
 
 function compact(text) {
   return String(text || "").replace(/\s+/g, " ").trim().slice(0, 120) || "等待输入";
+}
+
+function applyBuildInfo() {
+  var config = window.__APP_CONFIG || {};
+  var version = String(config.version || "dev").trim();
+  if (!version) version = "dev";
+  if (version.charAt(0) !== "v") {
+    version = "v" + version;
+  }
+  Array.from(versionNodes || []).forEach(function (node) {
+    node.textContent = version;
+  });
+}
+
+function showError(message) {
+  var text = compact(message || "操作失败");
+  footerState.textContent = "error";
+  footerDetail.textContent = text;
+  if (!errorToast) {
+    return;
+  }
+  errorToast.textContent = text;
+  errorToast.hidden = false;
+  clearTimeout(errorToastTimer);
+  errorToastTimer = setTimeout(function () {
+    errorToast.hidden = true;
+  }, 3200);
 }
 
 function shouldRenderMarkdown(message) {
@@ -220,49 +249,12 @@ function scheduleStatusRefresh(delay) {
   }, delay == null ? 250 : delay);
 }
 
-function startWorkingTimer() {
-  if (workingTimer) return;
-  workingTimer = setInterval(updateWorkingElapsed, 100);
-}
-
-function stopWorkingTimer() {
-  if (workingTimer) {
-    clearInterval(workingTimer);
-    workingTimer = null;
-  }
-  workingStartedAt = 0;
-}
-
-function updateWorkingElapsed() {
-  if (!workingElapsed || !workingStartedAt) return;
-  var seconds = Math.max(0, (Date.now() - workingStartedAt) / 1000);
-  workingElapsed.textContent = Math.floor(seconds) + "s";
-}
-
 function ensureWorkingPlaceholder() {
-  if (!workingStartedAt) {
-    workingStartedAt = Date.now();
-  }
-  renderWorkingLabel("Working...");
-  if (workingDock) {
-    workingDock.hidden = false;
-  }
-  updateWorkingElapsed();
-  startWorkingTimer();
-  scrollToBottom();
+  return;
 }
 
 function removeWorkingPlaceholder() {
-  if (workingDock) {
-    workingDock.hidden = true;
-  }
-  if (workingLabel) {
-    workingLabel.innerHTML = "";
-  }
-  if (workingElapsed) {
-    workingElapsed.textContent = "";
-  }
-  stopWorkingTimer();
+  return;
 }
 
 function shortSession(id) {
@@ -270,9 +262,31 @@ function shortSession(id) {
 }
 
 function resumeSummary(item) {
-  var text = compact(item.lastMessage || "");
-  var count = Number(item.messageCount || 0);
-  var updated = item.updatedAt ? formatTime(item.updatedAt) : "--:--";
-  var workdir = compact(item.workdir || "");
-  return [workdir || "无工作目录", text || "无消息记录", count + " 条消息", updated].join(" · ");
+  var parts = [];
+  if (item.running) parts.push("运行中");
+  parts.push(compact(item.workdir || "") || "无工作目录");
+  if (item.lastEvent) {
+    parts.push(compact(item.lastEvent));
+  } else if (item.lastMessage) {
+    parts.push(compact(item.lastMessage));
+  } else {
+    parts.push("无消息记录");
+  }
+  parts.push(Number(item.messageCount || 0) + " 条消息");
+  parts.push(item.updatedAt ? formatTime(item.updatedAt) : "--:--");
+  return parts.join(" · ");
+}
+
+function resumeWorkdir(item) {
+  return compact(item && item.workdir || "") || "无工作目录";
+}
+
+function resumeActivity(item) {
+  if (item && item.lastEvent) {
+    return compact(item.lastEvent);
+  }
+  if (item && item.lastMessage) {
+    return compact(item.lastMessage);
+  }
+  return "无消息记录";
 }

@@ -51,6 +51,7 @@
 
 1. Go `1.22+`
 2. 机器上可直接执行 `codex`
+   Windows 下需要确保 `codex.exe`（或对应 shim）已加入 `PATH`
 3. 已完成 `codex login`
 
 ## 启动

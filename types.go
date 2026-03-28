@@ -23,6 +23,7 @@ const (
 	appServerInitWait   = 15 * time.Second
 	appServerRPCTimeout = 30 * time.Second
 	authCookieName      = "codex_web_auth"
+	appVersion          = "1.0.3"
 )
 
 //go:embed static
@@ -39,6 +40,11 @@ type Message struct {
 type EventLog struct {
 	ID        string    `json:"id"`
 	Kind      string    `json:"kind"`
+	Category  string    `json:"category,omitempty"`
+	StepType  string    `json:"stepType,omitempty"`
+	Phase     string    `json:"phase,omitempty"`
+	Target    string    `json:"target,omitempty"`
+	Count     int       `json:"count,omitempty"`
 	Title     string    `json:"title"`
 	Body      string    `json:"body,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
@@ -127,7 +133,9 @@ type sessionSummary struct {
 	Workdir      string    `json:"workdir,omitempty"`
 	UpdatedAt    time.Time `json:"updatedAt"`
 	LastMessage  string    `json:"lastMessage,omitempty"`
+	LastEvent    string    `json:"lastEvent,omitempty"`
 	MessageCount int       `json:"messageCount"`
+	Running      bool      `json:"running"`
 }
 
 type serverEvent struct {

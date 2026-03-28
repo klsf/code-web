@@ -51,6 +51,7 @@ Some of these are local UI commands, while others call backend APIs or `codex ap
 
 1. Go `1.22+`
 2. `codex` must be executable on the machine
+   On Windows, make sure `codex.exe` (or its shim) is available in `PATH`
 3. `codex login` must already be completed
 
 ## Start

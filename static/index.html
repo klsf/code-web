@@ -5,14 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Codex Web</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="/app-config.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
 </head>
 <body>
+  <div id="errorToast" class="error-toast" hidden></div>
   <section id="loginScreen" class="login-screen" hidden>
     <form id="loginForm" class="login-card">
       <div class="login-title">Codex Web</div>
-      <div class="login-version">v1.0.2</div>
+      <div class="login-version" data-version>vdev</div>
       <input id="passwordInput" class="login-input" type="password" placeholder="请输入密码" autocomplete="current-password">
       <button id="loginButton" class="login-button" type="submit">登录</button>
       <div id="loginError" class="login-error"></div>
@@ -22,7 +24,7 @@
   <section id="sessionChooser" class="login-screen" hidden>
     <div class="login-card chooser-card">
       <div class="login-title">Codex Web</div>
-      <div class="login-version">v1.0.2</div>
+      <div class="login-version" data-version>vdev</div>
       <input id="workdirInput" class="login-input" type="text" placeholder="请输入工作目录，例如 /www/codex" value="/www/codex">
       <div class="chooser-actions">
         <button id="newSessionChoice" class="login-button" type="button">新建会话</button>
@@ -54,11 +56,18 @@
       </div>
     </aside>
 
+    <header class="desktop-topbar">
+      <div class="title-stack">
+        <div class="page-title">Codex Web</div>
+        <div class="page-subtitle"><span class="desktop-session-badge" id="desktopSessionBadge">会话初始化中</span> · <span class="desktop-transport-badge" id="desktopTransportBadge">连接中</span> · <span class="page-version" data-version>vdev</span></div>
+      </div>
+    </header>
+
     <main class="phone-shell">
       <header class="topbar">
         <div class="title-stack">
           <div class="page-title">Codex Web</div>
-          <div class="page-subtitle"><span id="sessionBadge">会话初始化中</span> · <span id="transportBadge">连接中</span> · <span class="page-version">v1.0.2</span></div>
+          <div class="page-subtitle"><span id="sessionBadge">会话初始化中</span> · <span id="transportBadge">连接中</span> · <span class="page-version" data-version>vdev</span></div>
         </div>
       </header>
 
@@ -67,27 +76,26 @@
       <section id="commandPalette" class="command-palette" hidden></section>
 
       <form id="composer" class="composer">
-        <section id="workingDock" class="working-dock" hidden>
-          <div class="working-pill">
-            <span id="workingLabel" class="working-text"></span>
-            <span id="workingElapsed" class="working-elapsed"></span>
-          </div>
-        </section>
+        <footer class="status-strip">
+          <span id="footerState">ready</span>
+          <span id="modelBadge">unknown</span>
+          <span id="cwdBadge">/</span>
+          <span id="footerDetail">waiting for input</span>
+        </footer>
         <section id="attachmentTray" class="attachment-tray"></section>
         <div class="composer-main">
           <textarea id="promptInput" rows="1" spellcheck="false" placeholder="发送消息或按住说话..."></textarea>
           <input id="imageInput" type="file" accept="image/*" multiple hidden>
-          <button class="round-icon" type="button" id="imageBtn" aria-label="图片">◫</button>
+          <button class="round-icon" type="button" id="imageBtn" aria-label="图片">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="4.5" y="5.5" width="15" height="13" rx="2.5"></rect>
+              <circle cx="9" cy="10" r="1.5"></circle>
+              <path d="M7 16l3.2-3.2a1 1 0 0 1 1.4 0L13 14l1.7-1.7a1 1 0 0 1 1.4 0L17.5 14"></path>
+            </svg>
+          </button>
           <button class="round-icon" type="submit" id="sendBtn" aria-label="发送">↑</button>
         </div>
       </form>
-
-      <footer class="status-strip">
-        <span id="footerState">ready</span>
-        <span id="modelBadge">unknown</span>
-        <span id="cwdBadge">/</span>
-        <span id="footerDetail">waiting for input</span>
-      </footer>
     </main>
   </div>
 
