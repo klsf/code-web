@@ -1,11 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
-	"embed"
 	"encoding/hex"
 	"encoding/json"
-	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
@@ -15,20 +14,37 @@ import (
 )
 
 const (
-	addr                = "0.0.0.0:991"
-	dataDir             = "data/sessions"
-	uploadsDir          = "data/uploads"
-	appServerURL        = "ws://127.0.0.1:8765"
-	appServerInitWait   = 15 * time.Second
-	appServerRPCTimeout = 30 * time.Second
-	authCookieName      = "codex_web_auth"
-	appVersion          = "1.0.4"
+	addr                   = "0.0.0.0:991"
+	uploadsDir             = "data/uploads"
+	logsDir                = "data/logs"
+	codexSettingsPath      = "codex-settings.json"
+	claudeSettingsPath     = "claude-settings.json"
+	appServerURL           = "ws://127.0.0.1:8765"
+	appServerInitWait      = 15 * time.Second
+	appServerRPCTimeout    = 30 * time.Second
+	appServerPingInterval  = 15 * time.Second
+	appServerReadTimeout   = 300 * time.Second
+	appServerTurnTimeout   = 60 * time.Second
+	appServerThreadReadTTL = 20 * time.Second
+	appServerRetryDelay    = 2 * time.Second
+	appServerRetryMaxDelay = 30 * time.Second
+	staleTaskIdle          = 45 * time.Second
+	authCookieName         = "codex_web_auth"
+	appVersion             = "1.1.1"
 )
 
 var defaultWorkdir = "."
+var assetVersion = nextAssetVersion()
 
-//go:embed static
-var embeddedStatic embed.FS
+type restoreRef struct {
+	RefID             string `json:"refId,omitempty"`
+	LocalSessionID    string `json:"localSessionId,omitempty"`
+	Provider          string `json:"provider"`
+	Model             string `json:"model,omitempty"`
+	Workdir           string `json:"workdir,omitempty"`
+	CodexThreadID     string `json:"codexThreadId,omitempty"`
+	ProviderSessionID string `json:"providerSessionId,omitempty"`
+}
 
 type Message struct {
 	ID        string    `json:"id"`
@@ -52,26 +68,35 @@ type EventLog struct {
 }
 
 type Session struct {
-	ID            string     `json:"id"`
-	Workdir       string     `json:"workdir,omitempty"`
-	CodexThreadID string     `json:"codexThreadId,omitempty"`
-	ActiveTurnID  string     `json:"activeTurnId,omitempty"`
-	Messages      []Message  `json:"messages"`
-	Events        []EventLog `json:"events,omitempty"`
-	DraftMessage  *Message   `json:"draftMessage,omitempty"`
-	ActiveTaskID  string     `json:"activeTaskId,omitempty"`
-	UpdatedAt     time.Time  `json:"updatedAt"`
+	ID                string      `json:"id"`
+	RestoreRef        *restoreRef `json:"restoreRef,omitempty"`
+	Provider          string      `json:"provider,omitempty"`
+	Model             string      `json:"model,omitempty"`
+	Workdir           string      `json:"workdir,omitempty"`
+	CodexThreadID     string      `json:"codexThreadId,omitempty"`
+	ProviderSessionID string      `json:"providerSessionId,omitempty"`
+	ActiveTurnID      string      `json:"activeTurnId,omitempty"`
+	Messages          []Message   `json:"messages"`
+	Events            []EventLog  `json:"events,omitempty"`
+	DraftMessage      *Message    `json:"draftMessage,omitempty"`
+	ActiveTaskID      string      `json:"activeTaskId,omitempty"`
+	UpdatedAt         time.Time   `json:"updatedAt"`
 }
 
 type sessionRuntime struct {
 	session       *Session
 	clients       map[*clientConn]struct{}
 	stopRequested bool
+	cancelTask    context.CancelFunc
 }
 
 type clientConn struct {
-	conn *websocket.Conn
-	mu   sync.Mutex
+	conn      *websocket.Conn
+	stateMu   sync.Mutex
+	writeMu   sync.Mutex
+	send      chan serverEvent
+	closed    bool
+	closeOnce sync.Once
 }
 
 type sessionStore struct {
@@ -103,24 +128,42 @@ type loginRequest struct {
 }
 
 type newSessionRequest struct {
-	Workdir string `json:"workdir"`
+	Workdir  string `json:"workdir"`
+	Provider string `json:"provider,omitempty"`
+}
+
+type restoreSessionRequest struct {
+	RestoreRef        *restoreRef `json:"restoreRef,omitempty"`
+	Provider          string      `json:"provider,omitempty"`
+	Model             string      `json:"model,omitempty"`
+	Workdir           string      `json:"workdir,omitempty"`
+	CodexThreadID     string      `json:"codexThreadId,omitempty"`
+	ProviderSessionID string      `json:"providerSessionId,omitempty"`
+	Messages          []Message   `json:"messages,omitempty"`
+	Events            []EventLog  `json:"events,omitempty"`
+	DraftMessage      *Message    `json:"draftMessage,omitempty"`
 }
 
 type statusResponse struct {
-	Model          string          `json:"model"`
-	Cwd            string          `json:"cwd"`
-	SessionID      string          `json:"sessionId"`
-	Transport      string          `json:"transport"`
-	Task           string          `json:"task"`
-	ApprovalPolicy string          `json:"approvalPolicy"`
-	ServiceTier    string          `json:"serviceTier,omitempty"`
-	FastMode       bool            `json:"fastMode"`
-	RateLimits     *rateLimitsData `json:"rateLimits,omitempty"`
+	RestoreRef        *restoreRef     `json:"restoreRef,omitempty"`
+	Provider          string          `json:"provider"`
+	Model             string          `json:"model"`
+	Cwd               string          `json:"cwd"`
+	SessionID         string          `json:"sessionId"`
+	CodexThreadID     string          `json:"codexThreadId,omitempty"`
+	ProviderSessionID string          `json:"providerSessionId,omitempty"`
+	Transport         string          `json:"transport"`
+	Task              string          `json:"task"`
+	ApprovalPolicy    string          `json:"approvalPolicy"`
+	ServiceTier       string          `json:"serviceTier,omitempty"`
+	FastMode          bool            `json:"fastMode"`
+	RateLimits        *rateLimitsData `json:"rateLimits,omitempty"`
 }
 
 type modelsResponse struct {
-	Current string      `json:"current"`
-	Items   []modelInfo `json:"items"`
+	Provider string      `json:"provider"`
+	Current  string      `json:"current"`
+	Items    []modelInfo `json:"items"`
 }
 
 type skillsResponse struct {
@@ -132,13 +175,18 @@ type sessionsResponse struct {
 }
 
 type sessionSummary struct {
-	ID           string    `json:"id"`
-	Workdir      string    `json:"workdir,omitempty"`
-	UpdatedAt    time.Time `json:"updatedAt"`
-	LastMessage  string    `json:"lastMessage,omitempty"`
-	LastEvent    string    `json:"lastEvent,omitempty"`
-	MessageCount int       `json:"messageCount"`
-	Running      bool      `json:"running"`
+	RestoreRef        *restoreRef `json:"restoreRef,omitempty"`
+	ID                string      `json:"id"`
+	Provider          string      `json:"provider,omitempty"`
+	Model             string      `json:"model,omitempty"`
+	Workdir           string      `json:"workdir,omitempty"`
+	CodexThreadID     string      `json:"codexThreadId,omitempty"`
+	ProviderSessionID string      `json:"providerSessionId,omitempty"`
+	UpdatedAt         time.Time   `json:"updatedAt"`
+	LastMessage       string      `json:"lastMessage,omitempty"`
+	LastEvent         string      `json:"lastEvent,omitempty"`
+	MessageCount      int         `json:"messageCount"`
+	Running           bool        `json:"running"`
 }
 
 type serverEvent struct {
@@ -155,6 +203,7 @@ type serverEvent struct {
 }
 
 type appMeta struct {
+	Provider       string `json:"provider"`
 	Model          string `json:"model"`
 	Cwd            string `json:"cwd"`
 	ApprovalPolicy string `json:"approvalPolicy"`
@@ -163,9 +212,12 @@ type appMeta struct {
 }
 
 type codexAuthManager struct {
-	mu      sync.Mutex
-	session *codexAuthSession
-	proc    *exec.Cmd
+	mu                 sync.Mutex
+	session            *codexAuthSession
+	proc               *exec.Cmd
+	loginCheckedAt     time.Time
+	loginStatusCached  bool
+	loginMessageCached string
 }
 
 type codexAuthSession struct {
@@ -210,10 +262,18 @@ type appServerClient struct {
 	writeMu       sync.Mutex
 	conn          *websocket.Conn
 	proc          *exec.Cmd
+	closed        bool
+	reconnecting  bool
 	initialized   bool
+	lastReadAt    time.Time
+	lastErrorAt   time.Time
+	lastErrorText string
+	suspectAt     time.Time
+	suspectReason string
 	pending       map[string]chan rpcPacket
 	threadSession map[string]string
 	threadTurn    map[string]string
+	turnSession   map[string]string
 	loadedThreads map[string]bool
 }
 
@@ -223,12 +283,18 @@ type threadStartResult struct {
 	} `json:"thread"`
 }
 
+type threadReadResult struct {
+	Thread map[string]interface{} `json:"thread"`
+}
+
 type notificationEnvelope struct {
 	ThreadID string                 `json:"threadId"`
 	TurnID   string                 `json:"turnId"`
 	ItemID   string                 `json:"itemId"`
 	Delta    string                 `json:"delta"`
 	Message  string                 `json:"message"`
+	Name     string                 `json:"name"`
+	Status   map[string]interface{} `json:"status"`
 	Thread   map[string]interface{} `json:"thread"`
 	Item     map[string]interface{} `json:"item"`
 	Turn     map[string]interface{} `json:"turn"`
@@ -286,8 +352,15 @@ type skillInfo struct {
 	Path        string `json:"path"`
 }
 
+type providerInfo struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+	Available   bool   `json:"available"`
+	IsDefault   bool   `json:"isDefault"`
+}
+
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: sameOriginRequest,
 }
 
 func authTokenForPassword(password string) string {

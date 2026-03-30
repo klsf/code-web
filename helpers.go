@@ -5,16 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 func defaultCodexHome() (string, error) {
@@ -39,6 +41,107 @@ func codexHomeDir() string {
 	return path
 }
 
+func nextAssetVersion() string {
+	return appVersion + "-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+}
+
+func normalizeRestoreRef(ref *restoreRef) *restoreRef {
+	if ref == nil {
+		return nil
+	}
+	provider := strings.TrimSpace(strings.ToLower(ref.Provider))
+	codexThreadID := strings.TrimSpace(ref.CodexThreadID)
+	providerSessionID := strings.TrimSpace(ref.ProviderSessionID)
+	if provider == "" || (codexThreadID == "" && providerSessionID == "") {
+		return nil
+	}
+	normalized := &restoreRef{
+		LocalSessionID:    strings.TrimSpace(ref.LocalSessionID),
+		Provider:          provider,
+		Model:             strings.TrimSpace(ref.Model),
+		Workdir:           normalizeWorkdir(ref.Workdir),
+		CodexThreadID:     codexThreadID,
+		ProviderSessionID: providerSessionID,
+	}
+	normalized.RefID = firstNonEmpty(
+		strings.TrimSpace(ref.RefID),
+		provider+"|"+firstNonEmpty(codexThreadID, providerSessionID),
+	)
+	return normalized
+}
+
+func sessionRestoreRef(session *Session) *restoreRef {
+	if session == nil {
+		return nil
+	}
+	return normalizeRestoreRef(&restoreRef{
+		LocalSessionID:    strings.TrimSpace(session.ID),
+		Provider:          strings.TrimSpace(session.Provider),
+		Model:             strings.TrimSpace(session.Model),
+		Workdir:           normalizeWorkdir(session.Workdir),
+		CodexThreadID:     strings.TrimSpace(session.CodexThreadID),
+		ProviderSessionID: strings.TrimSpace(session.ProviderSessionID),
+	})
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(parsed.Host, r.Host) {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpPath, perm); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
 func ensureCodexHome() error {
 	current := strings.TrimSpace(os.Getenv("CODEX_HOME"))
 	if current != "" {
@@ -56,7 +159,7 @@ func ensureCodexHome() error {
 		return fmt.Errorf("create codex home: %w", err)
 	}
 	if current != "" && filepath.Clean(current) != fallback {
-		log.Printf("invalid CODEX_HOME %q; using %q instead", current, fallback)
+		appLog.Warn().Str("codex_home", current).Str("fallback", fallback).Msg("invalid CODEX_HOME, using fallback")
 	}
 	return os.Setenv("CODEX_HOME", fallback)
 }
@@ -70,6 +173,46 @@ func writeJSONStatus(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+type apiResponseEnvelope struct {
+	Status  int         `json:"status"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data"`
+}
+
+func normalizeAPIData(v interface{}) interface{} {
+	if v == nil {
+		return map[string]interface{}{}
+	}
+	return v
+}
+
+func writeAPIJSON(w http.ResponseWriter, data interface{}) {
+	writeJSON(w, apiResponseEnvelope{
+		Status:  0,
+		Message: "",
+		Data:    normalizeAPIData(data),
+	})
+}
+
+func writeAPIJSONStatus(w http.ResponseWriter, status int, data interface{}) {
+	writeJSONStatus(w, status, apiResponseEnvelope{
+		Status:  0,
+		Message: "",
+		Data:    normalizeAPIData(data),
+	})
+}
+
+func writeAPIError(w http.ResponseWriter, statusCode int, message string, data interface{}) {
+	if strings.TrimSpace(message) == "" {
+		message = http.StatusText(statusCode)
+	}
+	writeJSONStatus(w, statusCode, apiResponseEnvelope{
+		Status:  1,
+		Message: message,
+		Data:    normalizeAPIData(data),
+	})
 }
 
 func saveUploadedFile(file multipart.File, header *multipart.FileHeader) (string, error) {
@@ -141,9 +284,9 @@ func ensureCodexAvailable() error {
 	path, err := exec.LookPath("codex")
 	if err != nil {
 		if runtime.GOOS == "windows" {
-			return errors.New("codex executable not found in PATH; install Codex CLI and ensure `codex.exe` (or its shim) is available in PATH before starting codex-web")
+			return errors.New("codex executable not found in PATH; install Codex CLI and ensure `codex.exe` (or its shim) is available in PATH before starting code-web")
 		}
-		return errors.New("codex executable not found in PATH; install Codex CLI and ensure `codex` is available in PATH before starting codex-web")
+		return errors.New("codex executable not found in PATH; install Codex CLI and ensure `codex` is available in PATH before starting code-web")
 	}
 	if strings.TrimSpace(path) == "" {
 		return errors.New("codex executable path is empty")
@@ -152,7 +295,17 @@ func ensureCodexAvailable() error {
 }
 
 func listInstalledSkills() ([]skillInfo, error) {
-	root := filepath.Join(codexHomeDir(), "skills")
+	rootBase := providerHomeDir()
+	if strings.TrimSpace(rootBase) == "" {
+		return []skillInfo{}, nil
+	}
+	root := filepath.Join(rootBase, "skills")
+	if _, err := os.Stat(root); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []skillInfo{}, nil
+		}
+		return nil, err
+	}
 	items := make([]skillInfo, 0, 16)
 	seen := make(map[string]bool)
 
@@ -668,6 +821,56 @@ func summarizeItemDetails(itemType string, item map[string]interface{}) string {
 	return ""
 }
 
+func summarizePlanUpdate(data map[string]interface{}) string {
+	explanation := strings.TrimSpace(lookupNestedString(data, "explanation"))
+	planValues, _ := nestedValue(data, "plan").([]interface{})
+	steps := make([]string, 0, len(planValues))
+	for _, value := range planValues {
+		step, ok := value.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		text := strings.TrimSpace(stringField(step, "step"))
+		if text == "" {
+			continue
+		}
+		status := strings.TrimSpace(stringField(step, "status"))
+		if status != "" {
+			text = "[" + status + "] " + text
+		}
+		steps = append(steps, text)
+	}
+	parts := make([]string, 0, 2)
+	if explanation != "" {
+		parts = append(parts, explanation)
+	}
+	if len(steps) > 0 {
+		preview := strings.Join(steps[:minInt(len(steps), 3)], "\n")
+		if len(steps) > 3 {
+			preview += fmt.Sprintf("\n+%d more", len(steps)-3)
+		}
+		parts = append(parts, preview)
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+}
+
+func summarizeConfigWarning(data map[string]interface{}) string {
+	summary := strings.TrimSpace(stringField(data, "summary"))
+	details := strings.TrimSpace(stringField(data, "details"))
+	path := strings.TrimSpace(stringField(data, "path"))
+	parts := make([]string, 0, 3)
+	if summary != "" {
+		parts = append(parts, summary)
+	}
+	if path != "" {
+		parts = append(parts, path)
+	}
+	if details != "" {
+		parts = append(parts, details)
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
 func itemStartedTitle(itemType string) string {
 	switch itemType {
 	case "readfile", "read_file":
@@ -735,6 +938,10 @@ func eventFields(kind, title, body string) (string, string, string, string, int)
 		return "thread", "compact", "started", "", 0
 	case lowerTitle == "review started":
 		return "review", "review", "started", "", 0
+	case strings.HasSuffix(lowerTitle, " completed"):
+		return "step", normalizeItemType(strings.TrimSpace(strings.TrimSuffix(lowerTitle, " completed"))), "completed", body, 0
+	case strings.HasSuffix(lowerTitle, " started"):
+		return "step", normalizeItemType(strings.TrimSpace(strings.TrimSuffix(lowerTitle, " started"))), "started", body, 0
 	case body != "":
 		return "step", normalizeItemType(lowerTitle), "started", body, 0
 	default:
@@ -775,6 +982,9 @@ func stepSummaryText(event EventLog) string {
 }
 
 func detectServiceTier() string {
+	if !supportsFastMode() {
+		return ""
+	}
 	raw, err := os.ReadFile(filepath.Join(codexHomeDir(), "config.toml"))
 	if err != nil {
 		return ""
@@ -847,8 +1057,81 @@ func cloneClients(src map[*clientConn]struct{}) map[*clientConn]struct{} {
 
 func broadcastJSON(clients map[*clientConn]struct{}, event serverEvent) {
 	for client := range clients {
-		client.mu.Lock()
-		_ = client.conn.WriteJSON(event)
-		client.mu.Unlock()
+		if !enqueueClientEvent(client, event) {
+			providerLog.Warn().Msg("client send queue is full, closing websocket client")
+			closeClientConn(client)
+		}
 	}
+}
+
+func writeClientJSON(client *clientConn, event serverEvent) error {
+	if client == nil || client.conn == nil {
+		return errors.New("client connection is nil")
+	}
+	client.writeMu.Lock()
+	defer client.writeMu.Unlock()
+	_ = client.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	err := client.conn.WriteJSON(event)
+	_ = client.conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		_ = client.conn.Close()
+	}
+	return err
+}
+
+func newClientConn(conn *websocket.Conn) *clientConn {
+	return &clientConn{
+		conn: conn,
+		send: make(chan serverEvent, 256),
+	}
+}
+
+func enqueueClientEvent(client *clientConn, event serverEvent) bool {
+	if client == nil {
+		return false
+	}
+	client.stateMu.Lock()
+	defer client.stateMu.Unlock()
+	if client.closed || client.send == nil {
+		return false
+	}
+	select {
+	case client.send <- event:
+		return true
+	default:
+		return false
+	}
+}
+
+func startClientWriter(client *clientConn) {
+	if client == nil {
+		return
+	}
+	go func() {
+		for event := range client.send {
+			if err := writeClientJSON(client, event); err != nil {
+				return
+			}
+		}
+	}()
+}
+
+func closeClientConn(client *clientConn) {
+	if client == nil {
+		return
+	}
+	client.closeOnce.Do(func() {
+		client.stateMu.Lock()
+		client.closed = true
+		send := client.send
+		client.send = nil
+		conn := client.conn
+		client.stateMu.Unlock()
+		if client.conn != nil {
+			_ = conn.Close()
+		}
+		if send != nil {
+			close(send)
+		}
+	})
 }

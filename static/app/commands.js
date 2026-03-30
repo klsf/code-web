@@ -3,25 +3,31 @@ commands = [
     input.value = "";
     hideCommandPalette();
     var res = await fetch("/api/status?sessionId=" + encodeURIComponent(currentSessionId));
-    if (!res.ok) throw new Error(await res.text());
-    var data = await res.json();
-    var lines = [
-      "model: " + data.model,
-      "cwd: " + data.cwd,
-      "session: " + shortSession(data.sessionId || currentSessionId),
-      "transport: " + data.transport,
-      "task: " + data.task,
-      "approvals: " + (data.approvalPolicy || "never"),
-      "fast: " + (data.fastMode ? "on" : "off"),
-      "service tier: " + (data.serviceTier || "default"),
-    ];
-    if (data.rateLimits) {
-      lines.push("plan: " + (data.rateLimits.planType || "unknown"));
-      if (data.rateLimits.primary) lines.push("primary: " + remainText(data.rateLimits.primary));
-      if (data.rateLimits.secondary) lines.push("secondary: " + remainText(data.rateLimits.secondary));
-      if (data.rateLimits.credits) lines.push("credits: " + creditText(data.rateLimits.credits));
+    var data = await apiJSON(res);
+    var content = "";
+    if ((data.provider || currentProvider || "unknown") === "codex") {
+      content = JSON.stringify(data, null, 2);
+    } else {
+      var lines = [
+        "provider: " + (data.provider || currentProvider || "unknown"),
+        "model: " + data.model,
+        "cwd: " + data.cwd,
+        "session: " + shortSession(data.sessionId || currentSessionId),
+        "transport: " + data.transport,
+        "task: " + data.task,
+        "approvals: " + (data.approvalPolicy || "never"),
+        "fast: " + (data.fastMode ? "on" : "off"),
+        "service tier: " + (data.serviceTier || "default"),
+      ];
+      if (data.rateLimits) {
+        lines.push("plan: " + (data.rateLimits.planType || "unknown"));
+        if (data.rateLimits.primary) lines.push("primary: " + remainText(data.rateLimits.primary));
+        if (data.rateLimits.secondary) lines.push("secondary: " + remainText(data.rateLimits.secondary));
+        if (data.rateLimits.credits) lines.push("credits: " + creditText(data.rateLimits.credits));
+      }
+      content = lines.join("\n");
     }
-    renderMessage({ id: "status-" + Date.now(), role: "system", content: lines.join("\n"), createdAt: new Date().toISOString() }, { animate: false });
+    renderMessage({ id: "status-" + Date.now(), role: "system", content: content, createdAt: new Date().toISOString() }, { animate: false });
   }},
   { name: "/skills", aliases: [":skills"], description: "快速选择可用 skills", action: async function () {
     var args = extractCommandArgs(input.value, ["/skills", ":skills"]);
@@ -47,9 +53,9 @@ commands = [
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: currentSessionId, command: "/fast", args: args }),
     });
-    if (!res.ok) throw new Error(await res.text());
-    var data = await res.json();
+    var data = await apiJSON(res);
     input.value = "";
+    setMeta({ fastMode: data.fastMode, serviceTier: data.serviceTier });
     renderMessage({ id: "fast-" + Date.now(), role: "system", content: "fast mode: " + (data.fastMode ? "on" : "off") + " (" + (data.serviceTier || "default") + ")", createdAt: new Date().toISOString() }, { animate: false });
   }},
   { name: "/stop", aliases: [":stop"], description: "终止当前正在执行的任务", action: async function () {
@@ -59,8 +65,7 @@ commands = [
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: currentSessionId, command: "/stop" }),
     });
-    if (!res.ok) throw new Error(await res.text());
-    var data = await res.json();
+    var data = await apiJSON(res);
     input.value = "";
     autoResize();
     renderMessage({ id: "stop-" + Date.now(), role: "system", content: data.stopped ? "已发送停止请求" : "当前没有正在执行的任务", createdAt: new Date().toISOString() }, { animate: false });
@@ -72,13 +77,12 @@ commands = [
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: currentSessionId, command: "/compact" }),
     });
-    if (!res.ok) throw new Error(await res.text());
-    var data = await res.json();
+    var data = await apiJSON(res);
     input.value = "";
     autoResize();
     renderMessage({ id: "compact-" + Date.now(), role: "system", content: data.compacted ? "已开始压缩当前会话上下文" : "当前会话还没有可压缩的上下文", createdAt: new Date().toISOString() }, { animate: false });
   }},
-  { name: "/resume", aliases: [":resume"], description: "恢复一个历史 Codex 会话", action: async function () {
+  { name: "/resume", aliases: [":resume"], description: "恢复一个历史会话", action: async function () {
     if (isRunning) throw new Error("任务执行中，先用 /stop 终止");
     var args = extractCommandArgs(input.value, ["/resume", ":resume"]);
     if (!args) {
@@ -88,8 +92,7 @@ commands = [
       return;
     }
     var res = await fetch("/api/sessions");
-    if (!res.ok) throw new Error(await res.text());
-    var data = await res.json();
+    var data = await apiJSON(res);
     var match = (data.items || []).find(function (item) { return String(item.id || "").startsWith(args); });
     if (!match) throw new Error("没有找到匹配的会话");
     await switchSession(match.id);
@@ -116,7 +119,8 @@ commands = [
       current.close();
     }
     clearTimeout(reconnectTimer);
-    localStorage.removeItem("codex_session_id");
+    clearStoredSession();
+    setCurrentSessionRef(null);
     currentSessionId = "";
     renderEmpty();
     setFooterStatus("ready", "请选择新建会话或恢复会话");
@@ -139,7 +143,8 @@ commands = [
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: currentSessionId, command: "/delete", args: targetId }),
     });
-    if (!res.ok) throw new Error(await res.text());
+    await apiJSON(res);
+    removeSessionRef(targetId);
     input.value = "";
     autoResize();
     if (deleteCurrent) {
@@ -162,9 +167,8 @@ commands = [
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: currentSessionId, command: "/model", args: args }),
     });
-    if (!res.ok) throw new Error(await res.text());
-    var data = await res.json();
-    if (data.model) modelBadge.textContent = data.model;
+    var data = await apiJSON(res);
+    setMeta({ model: data.model });
     input.value = "";
     renderMessage({ id: "model-" + Date.now(), role: "system", content: "model: " + data.model, createdAt: new Date().toISOString() }, { animate: false });
   }},
@@ -186,6 +190,9 @@ function matchingCommands(value) {
   var query = commandQuery(value).toLowerCase();
   if (!query) return [];
   return commands.filter(function (item) {
+    if (item.isAvailable && !item.isAvailable()) {
+      return false;
+    }
     return [item.name].concat(item.aliases || []).some(function (token) {
       return token.startsWith(query);
     });
@@ -269,9 +276,8 @@ function extractCommandArgs(raw, names) {
 
 async function openModelPalette() {
   paletteMode = "models";
-  var res = await fetch("/api/models");
-  if (!res.ok) throw new Error(await res.text());
-  var data = await res.json();
+  var res = await fetch("/api/models?sessionId=" + encodeURIComponent(currentSessionId));
+  var data = await apiJSON(res);
   commandItems = (data.items || []).map(function (item) {
     return {
       name: item.model || item.id,
@@ -289,8 +295,7 @@ async function openModelPalette() {
 async function openSkillsPalette() {
   paletteMode = "skills";
   var res = await fetch("/api/skills");
-  if (!res.ok) throw new Error(await res.text());
-  var data = await res.json();
+  var data = await apiJSON(res);
   commandItems = (data.items || []).map(function (item) {
     return { name: item.name, displayName: item.name, description: item.description || "", path: item.path || "" };
   });
@@ -300,6 +305,7 @@ async function openSkillsPalette() {
 }
 
 async function openFastPalette() {
+  if (!providerSupportsFast()) return hideCommandPalette();
   paletteMode = "fast";
   commandItems = [
     { name: "/fast on", displayName: "on", description: "开启 Fast mode" },
@@ -313,12 +319,18 @@ async function openFastPalette() {
 async function openResumePalette() {
   paletteMode = "sessions";
   var res = await fetch("/api/sessions");
-  if (!res.ok) throw new Error(await res.text());
-  var data = await res.json();
+  var data = await apiJSON(res);
   commandItems = (data.items || []).filter(function (item) {
     return item && item.id && item.id !== currentSessionId;
   }).map(function (item) {
-    return { id: item.id, name: "/resume " + item.id, displayName: shortSession(item.id), description: resumeSummary(item), updatedAt: item.updatedAt || "" };
+    var title = shortSession(item.id);
+    if (item && item.provider) title = String(item.provider).toUpperCase() + " · " + title;
+    var desc = [];
+    desc.push(sessionKindLabel(item) === "restored" ? "远端恢复" : "实时会话");
+    if (item.running) desc.push("运行中");
+    desc.push(resumeWorkdir(item));
+    desc.push(resumeActivity(item));
+    return { id: item.id, name: "/resume " + item.id, displayName: title, description: desc.join(" · "), updatedAt: item.updatedAt || "", provider: item.provider };
   });
   if (!commandItems.length) {
     commandItems = [{ name: "", displayName: "没有可恢复的历史会话", description: "当前没有其它历史会话可切换", disabled: true }];
@@ -330,12 +342,13 @@ async function openResumePalette() {
 async function openDeletePalette() {
   paletteMode = "delete_sessions";
   var res = await fetch("/api/sessions");
-  if (!res.ok) throw new Error(await res.text());
-  var data = await res.json();
+  var data = await apiJSON(res);
   commandItems = (data.items || []).filter(function (item) {
     return item && item.id && item.id !== currentSessionId;
   }).map(function (item) {
-    return { id: item.id, name: "/delete " + item.id, displayName: "删除 " + shortSession(item.id), description: resumeSummary(item) };
+    var title = "删除 " + shortSession(item.id);
+    if (item && item.provider) title = String(item.provider) + " · " + title;
+    return { id: item.id, name: "/delete " + item.id, displayName: title, description: resumeSummary(item) };
   });
   if (!commandItems.length) {
     commandItems = [{ name: "", displayName: "没有可删除的历史会话", description: "当前没有其它历史会话可删除", disabled: true }];
@@ -351,8 +364,7 @@ async function selectModel(item) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionId: currentSessionId, command: "/model", args: item.model || item.name }),
   });
-  if (!res.ok) throw new Error(await res.text());
-  var data = await res.json();
+  var data = await apiJSON(res);
   if (data.model) modelBadge.textContent = data.model;
   input.value = "";
   autoResize();
@@ -378,19 +390,32 @@ async function selectFastOption(item) {
 async function selectResumeSession(item) {
   hideCommandPalette();
   if (!item || !item.id) throw new Error("无效的会话");
-  await switchSession(item.id);
+  await switchSession(item.id, true, item.provider, item);
 }
 
 async function selectDeleteSession(item) {
   hideCommandPalette();
   if (!item || !item.id) throw new Error("无效的会话");
+  if (item.isStoredRef || item.restoreRef) {
+    removeSessionRef(item.restoreRef || item);
+    input.value = "";
+    autoResize();
+    renderMessage({ id: "delete-" + Date.now(), role: "system", content: "已删除远端会话引用 " + shortSession(item.id), createdAt: new Date().toISOString() }, { animate: false });
+    return;
+  }
   var res = await fetch("/api/command", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionId: currentSessionId, command: "/delete", args: item.id }),
   });
-  if (!res.ok) throw new Error(await res.text());
+  await apiJSON(res);
+  removeSessionRef(item);
   input.value = "";
   autoResize();
   renderMessage({ id: "delete-" + Date.now(), role: "system", content: "已删除会话 " + shortSession(item.id), createdAt: new Date().toISOString() }, { animate: false });
 }
+
+commands.forEach(function (item) {
+  if (item.name === "/fast") item.isAvailable = providerSupportsFast;
+  if (item.name === "/compact") item.isAvailable = providerSupportsCompact;
+});

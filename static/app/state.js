@@ -2,11 +2,15 @@ var timeline = document.getElementById("timeline");
 var loginScreen = document.getElementById("loginScreen");
 var errorToast = document.getElementById("errorToast");
 var versionNodes = document.querySelectorAll("[data-version]");
+var appTitleNodes = document.querySelectorAll("[data-app-title]");
 var loginForm = document.getElementById("loginForm");
 var passwordInput = document.getElementById("passwordInput");
 var loginError = document.getElementById("loginError");
 var sessionChooser = document.getElementById("sessionChooser");
+var providerPicker = document.getElementById("providerPicker");
 var codexAuthScreen = document.getElementById("codexAuthScreen");
+var authTitle = document.getElementById("authTitle");
+var authIntro = document.getElementById("authIntro");
 var codexAuthSteps = document.getElementById("codexAuthSteps");
 var newSessionChoice = document.getElementById("newSessionChoice");
 var resumeSessionChoice = document.getElementById("resumeSessionChoice");
@@ -25,6 +29,10 @@ var modelBadge = document.getElementById("modelBadge");
 var cwdBadge = document.getElementById("cwdBadge");
 var transportBadge = document.getElementById("transportBadge");
 var desktopTransportBadge = document.getElementById("desktopTransportBadge");
+var connectionBanner = document.getElementById("connectionBanner");
+var connectionBadge = document.getElementById("connectionBadge");
+var connectionTitle = document.getElementById("connectionTitle");
+var connectionDetail = document.getElementById("connectionDetail");
 var attachmentTray = document.getElementById("attachmentTray");
 var commandPalette = document.getElementById("commandPalette");
 var imageInput = document.getElementById("imageInput");
@@ -33,6 +41,7 @@ var sendBtn = document.getElementById("sendBtn");
 var footerState = document.getElementById("footerState");
 var footerDetail = document.getElementById("footerDetail");
 var statusSession = document.getElementById("statusSession");
+var statusProvider = document.getElementById("statusProvider");
 var statusModel = document.getElementById("statusModel");
 var statusCwd = document.getElementById("statusCwd");
 var statusTransport = document.getElementById("statusTransport");
@@ -50,7 +59,14 @@ var attachmentTemplate = document.getElementById("attachmentTemplate");
 var ws = null;
 var wsIntentionalClose = false;
 var reconnectTimer = null;
-var currentSessionId = localStorage.getItem("codex_session_id") || "";
+var currentSessionId =
+  localStorage.getItem("codex_session_id") ||
+  localStorage.getItem("sessionId") ||
+  localStorage.getItem("sessionid") ||
+  sessionStorage.getItem("codex_session_id") ||
+  sessionStorage.getItem("sessionId") ||
+  sessionStorage.getItem("sessionid") ||
+  "";
 var isRunning = false;
 var pendingImages = [];
 var activeDraftId = "";
@@ -58,9 +74,8 @@ var streamStates = new Map();
 var commandItems = [];
 var commandIndex = 0;
 var paletteMode = "commands";
-var statusRefreshTimer = null;
 var errorToastTimer = null;
 var isAuthenticated = false;
-var statusIntervalStarted = false;
 var commands = [];
 var currentCodexAuthSessionId = "";
+var currentProvider = (window.__APP_CONFIG && window.__APP_CONFIG.provider) || "codex";

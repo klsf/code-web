@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,38 +15,69 @@ import (
 
 func (s *sessionStore) handleNewSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
 
 	var req newSessionRequest
 	if r.Body != nil && r.ContentLength != 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid json body", http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, "invalid json body", nil)
 			return
 		}
 	}
 	workdir, err := validateWorkdir(req.Workdir)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
-	session := s.ensureSessionWithWorkdir("", workdir)
-	writeJSON(w, map[string]string{"sessionId": session.ID})
+	providerID := strings.TrimSpace(strings.ToLower(req.Provider))
+	if providerID == "" {
+		providerID = activeProvider.ID()
+	}
+	if _, ok := availableProviders[providerID]; !ok {
+		writeAPIError(w, http.StatusBadRequest, "provider is not available", nil)
+		return
+	}
+	session := s.ensureRuntime("", workdir, providerID).session
+	writeAPIJSON(w, map[string]string{"sessionId": session.ID})
+}
+
+func (s *sessionStore) handleRestoreSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+
+	var req restoreSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid json body", nil)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	session, err := s.restoreSession(ctx, req)
+	if err != nil {
+		appLog.Warn().Err(err).Msg("restore session failed")
+		writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+	writeAPIJSON(w, map[string]string{"sessionId": session.ID})
 }
 
 func (s *sessionStore) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json body", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid json body", nil)
 		return
 	}
 	if authTokenForPassword(req.Password) != s.authToken {
-		http.Error(w, "invalid password", http.StatusUnauthorized)
+		writeAPIError(w, http.StatusUnauthorized, "invalid password", nil)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -57,16 +88,16 @@ func (s *sessionStore) handleLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400 * 30,
 	})
-	writeJSON(w, map[string]bool{"ok": true})
+	writeAPIJSON(w, map[string]bool{"ok": true})
 }
 
 func (s *sessionStore) handleAuth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]bool{"authenticated": s.isAuthenticated(r)})
+	writeAPIJSON(w, map[string]bool{"authenticated": s.isAuthenticated(r)})
 }
 
 func (s *sessionStore) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -77,51 +108,115 @@ func (s *sessionStore) handleLogout(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
-	writeJSON(w, map[string]bool{"ok": true})
+	writeAPIJSON(w, map[string]bool{"ok": true})
 }
 
 func (s *sessionStore) handleAppConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	_, _ = w.Write([]byte("window.__APP_CONFIG = " + mustJSObject(map[string]interface{}{
-		"version":        strings.TrimSpace(appVersion),
-		"authGuideSteps": authGuideSteps,
+		"version":         strings.TrimSpace(appVersion),
+		"assetVersion":    strings.TrimSpace(assetVersion),
+		"authGuideSteps":  authGuideSteps,
+		"provider":        activeProvider.ID(),
+		"providerName":    activeProvider.DisplayName(),
+		"appName":         activeProvider.AppName(),
+		"requiresAuth":    activeProvider.RequiresAuth(),
+		"supportsFast":    supportsFastMode(),
+		"supportsCompact": supportsCompact(),
+		"providers":       availableProviderList(),
 	}) + ";\n"))
 }
 
-func (s *sessionStore) handleCodexAuthPage(w http.ResponseWriter, r *http.Request) {
+func (s *sessionStore) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+		staticAssetsHandler("static").ServeHTTP(w, r)
+		return
+	}
+
+	content, err := fs.ReadFile(staticFS, "index.html")
+	if err != nil {
+		http.Error(w, "index file not found", http.StatusInternalServerError)
+		return
+	}
+
+	html := strings.ReplaceAll(string(content), "__ASSET_VERSION__", assetVersion)
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(codexAuthPageHTML(
-		codexAuthReturnURL(r.URL.Query().Get("return")),
-		codexAuthForce(r.URL.Query().Get("force")),
-	)))
+	_, _ = w.Write([]byte(html))
+}
+
+func staticAssetsHandler(_ string) http.Handler {
+	fileServer := http.FileServer(http.FS(staticFS))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(r.URL.Query().Get("v")) != "" {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache, max-age=0")
+		}
+		fileServer.ServeHTTP(w, r)
+	})
+}
+
+func (s *sessionStore) handleCodexAuthPage(w http.ResponseWriter, r *http.Request) {
+	if _, ok := availableProviders[providerCodex]; !ok {
+		http.NotFound(w, r)
+		return
+	}
+	content, err := fs.ReadFile(staticFS, "codex-auth.html")
+	if err != nil {
+		http.Error(w, "codex auth page not found", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(content)
 }
 
 func (s *sessionStore) handleCodexAuthStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	writeJSON(w, s.auth.Status(codexAuthForce(r.URL.Query().Get("force"))))
+	if _, ok := availableProviders[providerCodex]; !ok {
+		writeAPIJSON(w, codexAuthStatusResponse{LoggedIn: true})
+		return
+	}
+	writeAPIJSON(w, s.auth.Status())
 }
 
 func (s *sessionStore) handleCodexAuthStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	if _, ok := availableProviders[providerCodex]; !ok {
+		writeAPIError(w, http.StatusNotFound, "current provider does not use codex auth", nil)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	writeJSON(w, s.auth.EnsureStarted(ctx, codexAuthForce(r.URL.Query().Get("force")), codexAuthRestart(r.URL.Query().Get("restart"))))
+	writeAPIJSON(w, s.auth.EnsureStarted(ctx, codexAuthRestart(r.URL.Query().Get("restart"))))
 }
 
 func (s *sessionStore) handleCodexAuthComplete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
+		return
+	}
+	if _, ok := availableProviders[providerCodex]; !ok {
+		writeAPIError(w, http.StatusNotFound, "current provider does not use codex auth", nil)
 		return
 	}
 	var req codexAuthCompleteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json body", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid json body", nil)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -130,8 +225,8 @@ func (s *sessionStore) handleCodexAuthComplete(w http.ResponseWriter, r *http.Re
 	current := s.auth.session
 	s.auth.mu.Unlock()
 	if current == nil || strings.TrimSpace(req.SessionID) == "" || req.SessionID != current.ID {
-		log.Printf("auth complete rejected: session mismatch current=%v incoming=%q", current != nil, strings.TrimSpace(req.SessionID))
-		writeJSONStatus(w, http.StatusBadRequest, codexAuthStatusResponse{
+		appLog.Warn().Bool("current_exists", current != nil).Str("incoming_session_id", strings.TrimSpace(req.SessionID)).Msg("auth complete rejected: session mismatch")
+		writeAPIError(w, http.StatusBadRequest, authStatusMessage("state mismatch"), codexAuthStatusResponse{
 			LoggedIn: false,
 			Session: &codexAuthSession{
 				ID:     strings.TrimSpace(req.SessionID),
@@ -142,8 +237,8 @@ func (s *sessionStore) handleCodexAuthComplete(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if parsed, err := url.Parse(strings.TrimSpace(req.CallbackURL)); err != nil || strings.TrimSpace(parsed.Query().Get("state")) == "" || strings.TrimSpace(parsed.Query().Get("state")) != current.State {
-		log.Printf("auth complete rejected: state mismatch session=%s", current.ID)
-		writeJSONStatus(w, http.StatusBadRequest, codexAuthStatusResponse{
+		appLog.Warn().Str("session", current.ID).Msg("auth complete rejected: state mismatch")
+		writeAPIError(w, http.StatusBadRequest, authStatusMessage("state mismatch"), codexAuthStatusResponse{
 			LoggedIn: false,
 			Session: &codexAuthSession{
 				ID:     current.ID,
@@ -154,39 +249,43 @@ func (s *sessionStore) handleCodexAuthComplete(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err := completeCodexAuth(ctx, req.CallbackURL); err != nil {
-		log.Printf("auth complete failed: session=%s error=%v", current.ID, err)
+		appLog.Error().Str("session", current.ID).Err(err).Msg("auth complete failed")
 		s.auth.mu.Lock()
 		if s.auth.session != nil {
 			s.auth.session.Status = "failed"
 			s.auth.session.Error = authStatusMessage(err.Error())
 		}
 		s.auth.mu.Unlock()
-		writeJSONStatus(w, http.StatusBadRequest, s.auth.Status(true))
+		writeAPIError(w, http.StatusBadRequest, authStatusMessage(err.Error()), s.auth.Status())
 		return
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if loggedIn, _ := codexLoginStatus(); loggedIn {
+		if loggedIn, _ := s.auth.loginStatus(true); loggedIn {
 			if s.app != nil {
 				s.resetSessionThreads()
 				restartErr := s.app.Restart(ctx, "Codex 登录账号已切换，当前任务已中断")
 				if restartErr != nil {
-					log.Printf("auth complete restart failed: session=%s error=%v", current.ID, restartErr)
-					writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "codex app-server restart failed"})
+					appLog.Error().Str("session", current.ID).Err(restartErr).Msg("auth complete restart failed")
+					writeAPIError(w, http.StatusInternalServerError, "codex app-server restart failed", nil)
 					return
 				}
 			}
-			log.Printf("auth complete confirmed: session=%s", current.ID)
-			writeJSON(w, s.auth.Status(false))
+			appLog.Info().Str("session", current.ID).Msg("auth complete confirmed")
+			writeAPIJSON(w, s.auth.Status())
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	log.Printf("auth complete pending after callback: session=%s", current.ID)
-	writeJSON(w, s.auth.Status(true))
+	appLog.Warn().Str("session", current.ID).Msg("auth complete pending after callback")
+	writeAPIJSON(w, s.auth.Status())
 }
 
 func (s *sessionStore) handleCodexAuthCallback(w http.ResponseWriter, r *http.Request) {
+	if _, ok := availableProviders[providerCodex]; !ok {
+		http.NotFound(w, r)
+		return
+	}
 	target, err := url.Parse(codexAuthProxyTarget())
 	if err != nil {
 		http.Error(w, "invalid callback target", http.StatusInternalServerError)
@@ -236,7 +335,7 @@ func (s *sessionStore) withAuth(next http.Handler) http.Handler {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-			writeJSONStatus(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			writeAPIError(w, http.StatusUnauthorized, "unauthorized", nil)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -262,20 +361,21 @@ func (s *sessionStore) handleWS(w http.ResponseWriter, r *http.Request) {
 	if err := conn.ReadJSON(&hello); err != nil {
 		return
 	}
+	client := newClientConn(conn)
 	if hello.Type != "hello" {
-		_ = conn.WriteJSON(serverEvent{Type: "error", Error: "first message must be hello"})
+		_ = writeClientJSON(client, serverEvent{Type: "error", Error: "first message must be hello"})
 		return
 	}
 
-	rt := s.attachClient(hello.SessionID, conn)
-	defer s.detachClient(rt.session.ID, conn)
+	rt, client := s.attachClient(hello.SessionID, conn)
+	defer s.detachClient(rt.session.ID, client)
 
-	if err := conn.WriteJSON(serverEvent{
+	if err := writeClientJSON(client, serverEvent{
 		Type:    "snapshot",
 		Session: s.cloneSession(rt.session.ID),
 		Running: rt.session.ActiveTaskID != "",
 		TaskID:  rt.session.ActiveTaskID,
-		Meta:    &s.meta,
+		Meta:    func() *appMeta { meta := s.metaForSession(rt.session.ID); return &meta }(),
 	}); err != nil {
 		return
 	}
@@ -289,30 +389,31 @@ func (s *sessionStore) handleWS(w http.ResponseWriter, r *http.Request) {
 		switch event.Type {
 		case "send":
 			if err := s.enqueuePrompt(rt.session.ID, strings.TrimSpace(event.Content), event.ImageIDs); err != nil {
-				_ = conn.WriteJSON(serverEvent{Type: "error", Error: err.Error()})
+				_ = writeClientJSON(client, serverEvent{Type: "error", Error: err.Error()})
 			}
 		case "ping":
-			if err := conn.WriteJSON(serverEvent{Type: "pong"}); err != nil {
+			if err := writeClientJSON(client, serverEvent{Type: "pong"}); err != nil {
 				return
 			}
 		default:
-			_ = conn.WriteJSON(serverEvent{Type: "error", Error: "unsupported event"})
+			_ = writeClientJSON(client, serverEvent{Type: "error", Error: "unsupported event"})
 		}
 	}
 }
 
-func (s *sessionStore) attachClient(sessionID string, conn *websocket.Conn) *sessionRuntime {
-	rt := s.ensureRuntime(sessionID, "")
-	client := &clientConn{conn: conn}
+func (s *sessionStore) attachClient(sessionID string, conn *websocket.Conn) (*sessionRuntime, *clientConn) {
+	rt := s.ensureRuntime(sessionID, "", "")
+	client := newClientConn(conn)
+	startClientWriter(client)
 
 	s.mu.Lock()
 	rt.clients[client] = struct{}{}
 	s.mu.Unlock()
 
-	return rt
+	return rt, client
 }
 
-func (s *sessionStore) detachClient(sessionID string, conn *websocket.Conn) {
+func (s *sessionStore) detachClient(sessionID string, target *clientConn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -321,8 +422,9 @@ func (s *sessionStore) detachClient(sessionID string, conn *websocket.Conn) {
 		return
 	}
 	for client := range rt.clients {
-		if client.conn == conn {
+		if client == target {
 			delete(rt.clients, client)
+			closeClientConn(client)
 			return
 		}
 	}
@@ -330,43 +432,48 @@ func (s *sessionStore) detachClient(sessionID string, conn *websocket.Conn) {
 
 func (s *sessionStore) handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
 	if err := r.ParseMultipartForm(20 << 20); err != nil {
-		http.Error(w, "invalid multipart form", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid multipart form", nil)
 		return
 	}
 	sessionID := strings.TrimSpace(r.FormValue("sessionId"))
 	content := strings.TrimSpace(r.FormValue("content"))
 	if sessionID == "" {
-		http.Error(w, "missing session id", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "missing session id", nil)
 		return
 	}
 
 	imageIDs, err := s.saveMultipartImages(r.MultipartForm.File["images"])
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 
 	if err := s.enqueuePrompt(sessionID, content, imageIDs); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
 
-	writeJSON(w, map[string]bool{"ok": true})
+	writeAPIJSON(w, map[string]bool{"ok": true})
 }
 
 func (s *sessionStore) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
 
 	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
+	if sessionID != "" {
+		s.reconcileSessionTask(sessionID)
+	}
 	resp := statusResponse{
-		Model:          s.currentModel(),
+		RestoreRef:     nil,
+		Provider:       activeProvider.ID(),
+		Model:          defaultModelForProviderID(activeProvider.ID()),
 		Cwd:            defaultWorkdir,
 		SessionID:      sessionID,
 		Transport:      "connected",
@@ -379,73 +486,74 @@ func (s *sessionStore) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if sessionID != "" {
 		session := s.cloneSession(sessionID)
 		if session != nil {
+			resp.RestoreRef = sessionRestoreRef(session)
+			resp.Provider = firstNonEmpty(strings.TrimSpace(session.Provider), activeProvider.ID())
+			resp.Model = firstNonEmpty(strings.TrimSpace(session.Model), defaultModelForProviderID(resp.Provider))
 			resp.SessionID = session.ID
 			resp.Cwd = normalizeWorkdir(session.Workdir)
+			resp.CodexThreadID = strings.TrimSpace(session.CodexThreadID)
+			resp.ProviderSessionID = strings.TrimSpace(session.ProviderSessionID)
 			if session.ActiveTaskID != "" {
 				resp.Task = "running"
 			}
 		}
 	}
 
-	if s.app != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		defer cancel()
-		limits, err := s.app.ReadRateLimits(ctx)
-		if err == nil {
-			resp.RateLimits = limits
-		}
-	}
-
-	writeJSON(w, resp)
+	writeAPIJSON(w, resp)
 }
 
 func (s *sessionStore) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	resp := modelsResponse{Current: s.currentModel(), Items: []modelInfo{}}
-	if s.app != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		defer cancel()
-		items, err := s.app.ListModels(ctx)
-		if err == nil {
-			resp.Items = items
-		}
+	sessionID := strings.TrimSpace(r.URL.Query().Get("sessionId"))
+	providerID := activeProvider.ID()
+	currentModel := defaultModelForProviderID(providerID)
+	if sessionID != "" {
+		providerID = s.sessionProvider(sessionID)
+		currentModel = s.sessionModel(sessionID)
 	}
-	writeJSON(w, resp)
+	resp := modelsResponse{Provider: providerID, Current: currentModel, Items: []modelInfo{}}
+	if items, err := providerForID(providerID).ListModels(r.Context(), s, sessionID); err == nil {
+		resp.Items = items
+	}
+	if len(resp.Items) == 0 {
+		resp.Items = defaultModelsForProvider(providerID)
+	}
+	writeAPIJSON(w, resp)
 }
 
 func (s *sessionStore) handleSkills(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
 	items, err := listInstalledSkills()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, err.Error(), nil)
 		return
 	}
-	writeJSON(w, skillsResponse{Items: items})
+	writeAPIJSON(w, skillsResponse{Items: items})
 }
 
 func (s *sessionStore) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
-	writeJSON(w, sessionsResponse{Items: s.listSessions()})
+	writeAPIJSON(w, sessionsResponse{Items: s.listSessions()})
 }
 
 func (s *sessionStore) handleCommand(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed", nil)
 		return
 	}
 
 	var req commandRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json body", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "invalid json body", nil)
 		return
 	}
 
@@ -453,52 +561,52 @@ func (s *sessionStore) handleCommand(w http.ResponseWriter, r *http.Request) {
 	req.Command = strings.TrimSpace(req.Command)
 	req.Args = strings.TrimSpace(req.Args)
 	if req.SessionID == "" || req.Command == "" {
-		http.Error(w, "missing sessionId or command", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "missing sessionId or command", nil)
 		return
 	}
 
 	switch req.Command {
 	case "/review":
 		if err := s.enqueueReview(req.SessionID, req.Args); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
-		writeJSON(w, map[string]bool{"ok": true})
+		writeAPIJSON(w, map[string]bool{"ok": true})
 	case "/model":
-		model, err := s.setModel(req.Args)
+		model, err := s.setModel(req.SessionID, req.Args)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": true, "model": model})
+		writeAPIJSON(w, map[string]interface{}{"ok": true, "model": model})
 	case "/approvals":
 		mode, err := s.setApprovalPolicy(req.Args)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": true, "approvalPolicy": mode})
+		writeAPIJSON(w, map[string]interface{}{"ok": true, "approvalPolicy": mode})
 	case "/fast":
-		mode, serviceTier, err := s.setFastMode(req.Args)
+		mode, serviceTier, err := s.setFastMode(req.SessionID, req.Args)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": true, "fastMode": mode, "serviceTier": serviceTier})
+		writeAPIJSON(w, map[string]interface{}{"ok": true, "fastMode": mode, "serviceTier": serviceTier})
 	case "/compact":
 		compacted, err := s.compactSession(req.SessionID)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": true, "compacted": compacted})
+		writeAPIJSON(w, map[string]interface{}{"ok": true, "compacted": compacted})
 	case "/stop":
 		stopped, err := s.stopActiveTask(req.SessionID)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": true, "stopped": stopped})
+		writeAPIJSON(w, map[string]interface{}{"ok": true, "stopped": stopped})
 	case "/delete":
 		targetID := req.SessionID
 		if req.Args != "" {
@@ -506,11 +614,11 @@ func (s *sessionStore) handleCommand(w http.ResponseWriter, r *http.Request) {
 		}
 		deleted, err := s.deleteSession(targetID)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeAPIError(w, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": true, "deleted": deleted, "sessionId": targetID})
+		writeAPIJSON(w, map[string]interface{}{"ok": true, "deleted": deleted, "sessionId": targetID})
 	default:
-		http.Error(w, "unsupported command", http.StatusBadRequest)
+		writeAPIError(w, http.StatusBadRequest, "unsupported command", nil)
 	}
 }

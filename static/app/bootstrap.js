@@ -93,7 +93,16 @@ loginForm.addEventListener("submit", async function (evt) {
 newSessionChoice.addEventListener("click", async function () {
   try {
     resumeEmpty.hidden = true;
-    await createSession(workdirInput.value, false);
+    var nextProvider = currentProvider;
+    if (providerRequiresAuthFor(nextProvider)) {
+      setCurrentProvider(nextProvider);
+      var authStatus = await checkCodexAuthStatus().catch(function () { return { loggedIn: true }; });
+      if (!authStatus.loggedIn) {
+        showCodexAuthScreen("当前机器上的 Codex 尚未授权，或授权已失效。");
+        return;
+      }
+    }
+    await createSession(workdirInput.value, false, nextProvider);
     enterApp();
   } catch (err) {
     resumeEmpty.hidden = false;
@@ -144,72 +153,47 @@ document.addEventListener("click", async function (evt) {
 resumeSessionChoice.addEventListener("click", function () {
   var raw = resumeSessionChoice.dataset.items || "[]";
   var items = JSON.parse(raw);
-  resumeList.innerHTML = "";
-  resumeList.hidden = false;
   resumeEmpty.hidden = items.length > 0;
-  items.forEach(function (item) {
-    var row = document.createElement("div");
-    row.className = "resume-item";
-
-    var openButton = document.createElement("button");
-    openButton.type = "button";
-    openButton.className = "resume-open";
-    openButton.innerHTML =
-      '<div class="resume-item-title">' +
-        shortSession(item.id) +
-        (item.running ? '<span class="resume-item-badge">running</span>' : '') +
-      '</div>' +
-      '<div class="resume-item-path">' + resumeWorkdir(item) + '</div>' +
-      '<div class="resume-item-desc">' + resumeActivity(item) + '</div>' +
-      '<div class="resume-item-meta">' + Number(item.messageCount || 0) + ' 条消息 · ' + (item.updatedAt ? formatTime(item.updatedAt) : "--:--") + '</div>';
-    openButton.addEventListener("click", async function () {
+  renderResumeList(items, {
+    onOpen: async function (item) {
       try {
-        openButton.disabled = true;
-        openButton.classList.add("is-loading");
-        await switchSession(item.id, false);
+        setConnectionBanner("restoring", "正在恢复 " + shortSession(item.id) + " 的远端上下文。");
+        await switchSession(item.id, false, item.provider, item);
         enterApp();
       } catch (err) {
-        openButton.disabled = false;
-        openButton.classList.remove("is-loading");
         showError(err && err.message ? err.message : "切换会话失败");
+        throw err;
       }
-    });
-
-    var deleteButton = document.createElement("button");
-    deleteButton.type = "button";
-    deleteButton.className = "resume-delete";
-    deleteButton.textContent = "×";
-    deleteButton.setAttribute("aria-label", "删除会话");
-    deleteButton.addEventListener("click", async function (evt) {
-      evt.stopPropagation();
-      var res = await fetch("/api/command", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: currentSessionId || item.id, command: "/delete", args: item.id }),
-      });
-      if (!res.ok) {
-        resumeEmpty.hidden = false;
-        resumeEmpty.textContent = await res.text();
-        showError(resumeEmpty.textContent);
-        return;
+    },
+    onDelete: async function (item, row) {
+      if (item.isStoredRef || item.restoreRef) {
+        removeSessionRef(item.restoreRef || item);
+      } else {
+        var res = await fetch("/api/command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: currentSessionId || item.id, command: "/delete", args: item.id }),
+        });
+        if (!res.ok) {
+          resumeEmpty.hidden = false;
+          resumeEmpty.textContent = await res.text();
+          showError(resumeEmpty.textContent);
+          return;
+        }
+        removeSessionRef(item);
       }
       row.remove();
-      var remaining = Array.from(resumeList.querySelectorAll(".resume-item")).length;
-      if (!remaining) {
+      var nextItems = items.filter(function (session) {
+        return session.id !== item.id;
+      });
+      resumeSessionChoice.dataset.items = JSON.stringify(nextItems);
+      if (!nextItems.length) {
         resumeEmpty.hidden = false;
         resumeEmpty.textContent = "没有可恢复的历史会话";
         resumeList.hidden = true;
         resumeSessionChoice.disabled = true;
       }
-      var nextItems = items.filter(function (session) {
-        return session.id !== item.id;
-      });
-      resumeSessionChoice.dataset.items = JSON.stringify(nextItems);
-    });
-
-    row.appendChild(openButton);
-    row.appendChild(deleteButton);
-    resumeList.appendChild(row);
+    }
   });
 });
 

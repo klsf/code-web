@@ -1,5 +1,5 @@
 # Binaries
-codex-web
+code-web
 *.exe
 *.exe~
 *.dll
@@ -11,12 +11,14 @@ codex-web
 server.log
 
 # Runtime data
-data/sessions/*.json
+data/log/*
 data/uploads/*
 !data/uploads/.gitkeep
 
 # Local backups
 backup_frontend_*
+claude-settings.json
+codex-settings.json
 
 # OS / editor
 .DS_Store

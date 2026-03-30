@@ -1,6 +1,6 @@
 function renderMessage(message, options) {
   var settings = Object.assign({ draft: false, animate: false }, options || {});
-  var key = messageKey(message);
+  var key = messageKey(message, settings);
   var node = findMessageNode(key);
   if (!node && settings.draft) {
     node = findDraftNode();
@@ -42,7 +42,7 @@ function renderMessage(message, options) {
   }
 
   if (settings.draft) {
-    setFooterStatus("Working", compact(message.content || "Codex 正在输出"));
+    setFooterStatus("Working", compact(message.content || (providerDisplayName() + " 正在输出")));
   } else if (message.role === "assistant") {
     removeWorkingPlaceholder();
   }
@@ -474,25 +474,31 @@ function revealBody(node, text, animated) {
 
   var chunks = text.match(/.{1,22}(\s|$)|.+$/g) || [text];
   var i = 0;
-  var timer = null;
+  var key = node.dataset.messageId || crypto.randomUUID();
+  node.dataset.messageId = key;
+  var state = {
+    timer: null,
+    node: node,
+    target: text,
+    displayed: text,
+    mode: "reveal",
+  };
 
   function step() {
     bubble.textContent = chunks.slice(0, i + 1).join("");
     scrollToBottom();
     i += 1;
     if (i < chunks.length) {
-      timer = setTimeout(step, 18);
+      state.timer = setTimeout(step, 18);
+      streamStates.set(key, state);
+      return;
     }
+    state.timer = null;
+    streamStates.set(key, state);
   }
 
   stopStream(node);
-  streamStates.set(node.dataset.messageId || crypto.randomUUID(), {
-    timer: timer,
-    node: node,
-    target: text,
-    displayed: text,
-    mode: "reveal",
-  });
+  streamStates.set(key, state);
   step();
 }
 
@@ -546,8 +552,15 @@ function renderAttachmentTray() {
   });
 }
 
-function messageKey(message) {
-  return message.id || [message.role, message.createdAt, message.content].join(":");
+function messageKey(message, options) {
+  var settings = options || {};
+  if (settings.draft) {
+    return message.id || ["draft", message.role, message.createdAt, message.content].join(":");
+  }
+  if (message.id && message.createdAt) {
+    return [message.id, message.createdAt].join(":");
+  }
+  return [message.id, message.role, message.createdAt, message.content].join(":");
 }
 
 function findMessageNode(id) {
@@ -560,9 +573,7 @@ function findDraftNode() {
 
 function removeOtherDrafts(finalId) {
   timeline.querySelectorAll(".bubble-row.is-draft").forEach(function (node) {
-    if (node.dataset.messageId !== finalId) {
-      node.remove();
-    }
+    node.remove();
   });
 }
 

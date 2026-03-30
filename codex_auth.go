@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,9 +31,36 @@ var authGuideSteps = []string{
 }
 
 const codexAuthSessionTTL = 15 * time.Minute
+const codexLoginStatusCacheTTL = 3 * time.Second
 
 func newCodexAuthManager() *codexAuthManager {
 	return &codexAuthManager{}
+}
+
+func (m *codexAuthManager) invalidateLoginStatusCacheLocked() {
+	m.loginCheckedAt = time.Time{}
+	m.loginStatusCached = false
+	m.loginMessageCached = ""
+}
+
+func (m *codexAuthManager) loginStatus(force bool) (bool, string) {
+	m.mu.Lock()
+	if !force && !m.loginCheckedAt.IsZero() && time.Since(m.loginCheckedAt) < codexLoginStatusCacheTTL {
+		loggedIn := m.loginStatusCached
+		message := m.loginMessageCached
+		m.mu.Unlock()
+		return loggedIn, message
+	}
+	m.mu.Unlock()
+
+	loggedIn, message := codexLoginStatus()
+
+	m.mu.Lock()
+	m.loginCheckedAt = time.Now()
+	m.loginStatusCached = loggedIn
+	m.loginMessageCached = message
+	m.mu.Unlock()
+	return loggedIn, message
 }
 
 func stripANSI(text string) string {
@@ -63,14 +89,6 @@ func isCodexAuthError(message string) bool {
 		strings.Contains(text, "login required") ||
 		strings.Contains(text, "logged out") ||
 		strings.Contains(text, "expired")
-}
-
-func authGuideJSArray() string {
-	parts := make([]string, 0, len(authGuideSteps))
-	for _, step := range authGuideSteps {
-		parts = append(parts, fmt.Sprintf("%q", step))
-	}
-	return "[" + strings.Join(parts, ",") + "]"
 }
 
 func authStatusMessage(message string) string {
@@ -137,35 +155,32 @@ func (m *codexAuthManager) expireLocked() {
 	m.stopLocked()
 	m.session.Status = "failed"
 	m.session.Error = authStatusMessage("operation timed out")
-	log.Printf("auth session expired: id=%s", m.session.ID)
+	authLog.Warn().Str("session_id", m.session.ID).Msg("auth session expired")
 }
 
-func (m *codexAuthManager) Status(force bool) codexAuthStatusResponse {
-	loggedIn, _ := codexLoginStatus()
+func (m *codexAuthManager) Status() codexAuthStatusResponse {
+	loggedIn, _ := m.loginStatus(false)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expireLocked()
-	if loggedIn && !force {
+	if loggedIn {
 		return codexAuthStatusResponse{LoggedIn: true, Session: m.session}
 	}
 	if m.session == nil {
-		return codexAuthStatusResponse{LoggedIn: loggedIn && !force}
+		return codexAuthStatusResponse{LoggedIn: false}
 	}
 	copySession := *m.session
 	copySession.Error = authStatusMessage(copySession.Error)
-	return codexAuthStatusResponse{LoggedIn: loggedIn && !force, Session: &copySession}
+	return codexAuthStatusResponse{LoggedIn: false, Session: &copySession}
 }
 
-func (m *codexAuthManager) EnsureStarted(ctx context.Context, force bool, restart bool) codexAuthStatusResponse {
-	if loggedIn, _ := codexLoginStatus(); loggedIn && !force {
-		return m.Status(false)
-	}
-
+func (m *codexAuthManager) EnsureStarted(ctx context.Context, restart bool) codexAuthStatusResponse {
 	m.mu.Lock()
 	m.expireLocked()
 	if restart {
 		m.stopLocked()
 		m.session = nil
+		m.invalidateLoginStatusCacheLocked()
 	}
 	if m.session != nil && (m.session.Status == "pending" || m.session.Status == "ready") {
 		copySession := *m.session
@@ -177,7 +192,7 @@ func (m *codexAuthManager) EnsureStarted(ctx context.Context, force bool, restar
 	session := newCodexAuthSession()
 	m.session = session
 	m.mu.Unlock()
-	log.Printf("auth session started: id=%s force=%t restart=%t", session.ID, force, restart)
+	authLog.Info().Str("session_id", session.ID).Bool("restart", restart).Msg("auth session started")
 
 	cmd := exec.Command("codex", "login")
 	stdout, _ := cmd.StdoutPipe()
@@ -217,9 +232,9 @@ func (m *codexAuthManager) EnsureStarted(ctx context.Context, force bool, restar
 			return
 		}
 		if err == nil {
-			if loggedIn, _ := codexLoginStatus(); loggedIn {
+			if loggedIn, _ := m.loginStatus(true); loggedIn {
 				session.Status = "complete"
-				log.Printf("auth session completed: id=%s", session.ID)
+				authLog.Info().Str("session_id", session.ID).Msg("auth session completed")
 				return
 			}
 		}
@@ -228,7 +243,7 @@ func (m *codexAuthManager) EnsureStarted(ctx context.Context, force bool, restar
 		if session.Error == "" && err != nil {
 			session.Error = authStatusMessage(err.Error())
 		}
-		log.Printf("auth session failed: id=%s error=%s", session.ID, session.Error)
+		authLog.Error().Str("session_id", session.ID).Str("error", session.Error).Msg("auth session failed")
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -239,13 +254,13 @@ func (m *codexAuthManager) EnsureStarted(ctx context.Context, force bool, restar
 		m.mu.Unlock()
 		if ready {
 			copySession.Status = "ready"
-			log.Printf("auth session ready: id=%s", copySession.ID)
+			authLog.Info().Str("session_id", copySession.ID).Msg("auth session ready")
 			return codexAuthStatusResponse{LoggedIn: false, Session: &copySession}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	return m.Status(force)
+	return m.Status()
 }
 
 func (m *codexAuthManager) captureAuthStream(session *codexAuthSession, r io.Reader, transcript *bytes.Buffer) {
@@ -277,181 +292,9 @@ func (m *codexAuthManager) captureAuthStream(session *codexAuthSession, r io.Rea
 	}
 }
 
-func codexAuthPageHTML(returnTo string, force bool) string {
-	return fmt.Sprintf(`<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>ChatGPT Account Verification</title>
-  <style>
-    body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#000; color:#f4f4f5; font-family:"PingFang SC","Noto Sans SC","Helvetica Neue",sans-serif; padding:24px; }
-    .card { width:min(420px,100%%); padding:22px; border:1px solid #23262d; border-radius:22px; background:#101113; box-shadow:0 24px 50px rgba(0,0,0,.35); }
-    .title { font-size:26px; font-weight:700; text-align:center; }
-    .sub { margin-top:8px; color:#9b9ba1; font-size:13px; line-height:1.6; text-align:center; }
-    .box { margin-top:16px; padding:16px; border-radius:16px; background:#0b0c0e; border:1px solid #1f2228; }
-    .steps { display:grid; gap:10px; }
-    .step { display:grid; grid-template-columns:26px 1fr; gap:10px; align-items:flex-start; }
-    .step-num { width:26px; height:26px; border-radius:999px; background:#1b2334; color:#b9ccff; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; }
-    .step-text { color:#d9dce3; font-size:13px; line-height:1.6; }
-    .label { color:#8f95a3; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
-    .input { width:100%%; margin-top:8px; min-height:116px; resize:vertical; box-sizing:border-box; border-radius:14px; border:1px solid #2a2f3a; background:#14171d; color:#eef2ff; padding:12px 14px; font:inherit; }
-    .actions { display:grid; gap:10px; margin-top:12px; }
-    .btn { display:flex; align-items:center; justify-content:center; height:46px; border-radius:14px; border:1px solid #2a2f3a; background:#1a1e27; color:#fff; text-decoration:none; }
-    .btn.primary { background:#2348d8; border-color:#2348d8; }
-    .btn.compact { width:180px; height:40px; margin:10px auto 0; }
-    .btn[disabled] { opacity:.55; pointer-events:none; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="title">ChatGPT 账户验证</div>
-    <div class="sub">按下面 3 步完成验证后，再回到这里提交回调链接。</div>
-    <div class="box">
-      <div class="steps" id="steps"></div>
-    </div>
-    <div class="box">
-      <div class="label">Callback Link</div>
-      <textarea id="callbackInput" class="input" placeholder="示例: http://localhost:1455/auth/callback?code=...&scope=...&state=..."></textarea>
-      <div class="actions">
-        <button id="completeAuth" class="btn" type="button">完成授权</button>
-      </div>
-    </div>
-  </div>
-  <script>
-    const returnTo = %q;
-    const force = %t;
-    const authGuideSteps = %s;
-    let pollTimer = null;
-    let currentSessionId = "";
-    function renderSteps() {
-      const steps = document.getElementById("steps");
-      steps.innerHTML = authGuideSteps.map((text, index) => {
-        const button = index === 0 ? '<button id="openAuth" class="btn primary compact" type="button">打开授权页面</button>' : '';
-        return '<div class="step"><div class="step-num">' + (index + 1) + '</div><div class="step-text">' + text + button + '</div></div>';
-      }).join("");
-      document.getElementById("openAuth").addEventListener("click", openAuth);
-    }
-    async function fetchStatus() {
-      const res = await fetch("/api/codex-auth/status" + (force ? "?force=1" : ""), { credentials: "same-origin" });
-      return res.json();
-    }
-    async function loadStatus() {
-      const data = await fetchStatus();
-      render(data);
-      if (data.loggedIn && !force) {
-        window.location.replace(returnTo);
-      }
-    }
-    function render(data) {
-      if (!data) return;
-      if (data.loggedIn && !force) {
-        document.getElementById("openAuth").disabled = true;
-        return;
-      }
-      const session = data.session || {};
-      if (session.id) {
-        currentSessionId = session.id;
-      }
-    }
-    async function openAuth() {
-      const button = document.getElementById("openAuth");
-      button.disabled = true;
-      try {
-        const query = new URLSearchParams();
-        if (force) query.set("force", "1");
-        query.set("restart", "1");
-        const suffix = "?" + query.toString();
-        const res = await fetch("/api/codex-auth/start" + suffix, { method: "POST", credentials: "same-origin" });
-        const data = await res.json();
-        render(data);
-        if (data.loggedIn && !force) {
-          window.location.replace(returnTo);
-          return;
-        }
-        const authURL = data && data.session && data.session.authUrl;
-        if (!authURL) {
-          alert((data.session && data.session.error) || "当前没有可用的授权链接，请重试。");
-          return;
-        }
-        window.open(authURL, "_blank", "noopener,noreferrer");
-      } catch (err) {
-        alert("生成授权链接失败。");
-      } finally {
-        button.disabled = false;
-        if (!pollTimer) {
-          poll();
-        }
-      }
-    }
-    async function completeAuth() {
-      const button = document.getElementById("completeAuth");
-      const input = document.getElementById("callbackInput");
-      const callbackUrl = String(input.value || "").trim();
-      if (!callbackUrl) {
-        alert("请先粘贴授权完成后的回调链接。");
-        return;
-      }
-      button.disabled = true;
-      try {
-        const res = await fetch("/api/codex-auth/complete", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: currentSessionId, callbackUrl }),
-        });
-        const data = await res.json();
-        render(data);
-        if (data.loggedIn) {
-          alert("验证成功，正在返回。");
-          window.location.replace(returnTo);
-          return;
-        }
-        alert((data.session && data.session.error) || "授权还未完成，请检查回调链接是否完整。");
-      } catch (err) {
-        alert("提交回调链接失败。");
-      } finally {
-        button.disabled = false;
-      }
-    }
-    function poll() {
-      pollTimer = setInterval(async () => {
-        const res = await fetch("/api/codex-auth/status" + (force ? "?force=1" : ""), { credentials: "same-origin" });
-        const data = await res.json();
-        render(data);
-        if (data.loggedIn && !force) {
-          clearInterval(pollTimer);
-          pollTimer = null;
-          window.location.replace(returnTo);
-        }
-      }, 2000);
-    }
-    renderSteps();
-    document.getElementById("completeAuth").addEventListener("click", completeAuth);
-    loadStatus();
-  </script>
-</body>
-</html>`, returnTo, force, authGuideJSArray())
-}
-
-func codexAuthReturnURL(raw string) string {
-	text := strings.TrimSpace(raw)
-	if text == "" {
-		return "/"
-	}
-	if parsed, err := url.Parse(text); err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") {
-		return parsed.String()
-	}
-	return "/"
-}
-
-func codexAuthForce(raw string) bool {
+func codexAuthRestart(raw string) bool {
 	text := strings.TrimSpace(strings.ToLower(raw))
 	return text == "1" || text == "true" || text == "yes"
-}
-
-func codexAuthRestart(raw string) bool {
-	return codexAuthForce(raw)
 }
 
 func codexAuthProxyTarget() string {

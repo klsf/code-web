@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Codex Web</title>
-  <link rel="stylesheet" href="/style.css">
-  <script src="/app-config.js"></script>
+  <title>Code Web</title>
+  <link rel="stylesheet" href="/style.css?v=__ASSET_VERSION__">
+  <script src="/app-config.js?v=__ASSET_VERSION__"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
 </head>
@@ -13,7 +13,7 @@
   <div id="errorToast" class="error-toast" hidden></div>
   <section id="loginScreen" class="login-screen" hidden>
     <form id="loginForm" class="login-card">
-      <div class="login-title">Codex Web</div>
+      <div class="login-title" data-app-title>Code Web</div>
       <div class="login-version" data-version>vdev</div>
       <input id="passwordInput" class="login-input" type="password" placeholder="请输入密码" autocomplete="current-password">
       <button id="loginButton" class="login-button" type="submit">登录</button>
@@ -23,9 +23,13 @@
 
   <section id="sessionChooser" class="login-screen" hidden>
     <div class="login-card chooser-card">
-      <div class="login-title">Codex Web</div>
+      <div class="login-title" data-app-title>Code Web</div>
       <div class="login-version" data-version>vdev</div>
-      <input id="workdirInput" class="login-input" type="text" placeholder="请输入工作目录，例如 /www/codex" value="/www/codex">
+      <div class="provider-picker-wrap">
+        <div class="provider-picker-label">选择工具</div>
+        <div id="providerPicker" class="provider-picker" role="radiogroup" aria-label="选择工具"></div>
+      </div>
+      <input id="workdirInput" class="login-input" type="text" placeholder="请输入工作目录，例如 /workspace/code-web" value="/workspace/code-web">
       <div class="chooser-actions">
         <button id="newSessionChoice" class="login-button" type="button">新建会话</button>
         <button id="resumeSessionChoice" class="login-button login-button-secondary" type="button">恢复会话</button>
@@ -37,15 +41,15 @@
 
   <section id="codexAuthScreen" class="login-screen" hidden>
     <div class="login-card chooser-card auth-card">
-      <div class="login-title">ChatGPT 账户验证</div>
+      <div id="authTitle" class="login-title">ChatGPT 账户验证</div>
       <div class="login-version" data-version>vdev</div>
-      <div class="login-error" style="min-height:auto">当前机器上的 Codex CLI 尚未完成 ChatGPT 账户验证，或验证已失效。</div>
+      <div id="authIntro" class="login-error login-error-compact">当前机器上的 Codex CLI 尚未完成 ChatGPT 账户验证，或验证已失效。</div>
       <div id="codexAuthSteps"></div>
-      <div class="resume-item" style="margin-top:12px">
-        <div class="resume-open" style="cursor:default">
+      <div class="resume-item auth-guide-item">
+        <div class="resume-open resume-open-static">
           <div class="resume-item-title">回调链接</div>
           <textarea id="codexAuthInput" class="login-input login-textarea" rows="4" placeholder="示例: http://localhost:1455/auth/callback?code=...&scope=...&state=..."></textarea>
-          <div class="chooser-actions" style="margin-top:12px">
+          <div class="chooser-actions auth-guide-actions">
             <button id="codexAuthComplete" class="login-button login-button-secondary" type="button">完成授权</button>
           </div>
         </div>
@@ -56,27 +60,20 @@
   <div class="app-shell">
     <aside class="desktop-sidebar">
       <div class="sidebar-card">
-        <div class="sidebar-title">status</div>
+        <div class="sidebar-title">状态</div>
         <div id="statusPanel" class="status-panel">
-          <div class="status-row"><span class="status-key">session</span><span id="statusSession" class="status-value">-</span></div>
-          <div class="status-row"><span class="status-key">model</span><span id="statusModel" class="status-value">unknown</span></div>
-          <div class="status-row"><span class="status-key">cwd</span><span id="statusCwd" class="status-value">/</span></div>
-          <div class="status-row"><span class="status-key">transport</span><span id="statusTransport" class="status-value">connecting</span></div>
-          <div class="status-row"><span class="status-key">task</span><span id="statusTask" class="status-value">idle</span></div>
-          <div class="status-row"><span class="status-key">approvals</span><span id="statusApprovals" class="status-value">never</span></div>
-          <div class="status-row"><span class="status-key">fast</span><span id="statusFast" class="status-value">off</span></div>
-          <div class="status-row"><span class="status-key">service tier</span><span id="statusServiceTier" class="status-value">default</span></div>
-          <div class="status-row"><span class="status-key">plan</span><span id="statusPlan" class="status-value">-</span></div>
-          <div class="status-row"><span class="status-key">primary</span><span id="statusPrimary" class="status-value">-</span></div>
-          <div class="status-row"><span class="status-key">secondary</span><span id="statusSecondary" class="status-value">-</span></div>
-          <div class="status-row"><span class="status-key">credits</span><span id="statusCredits" class="status-value">-</span></div>
+          <div class="status-row"><span class="status-key">工具</span><span id="statusProvider" class="status-value">-</span></div>
+          <div class="status-row"><span class="status-key">会话</span><span id="statusSession" class="status-value">-</span></div>
+          <div class="status-row"><span class="status-key">模型</span><span id="statusModel" class="status-value">unknown</span></div>
+          <div class="status-row"><span class="status-key">目录</span><span id="statusCwd" class="status-value">/</span></div>
+          <div class="status-row"><span class="status-key">快速</span><span id="statusFast" class="status-value">off</span></div>
         </div>
       </div>
     </aside>
 
     <header class="desktop-topbar">
       <div class="title-stack">
-        <div class="page-title">Codex Web</div>
+        <div class="page-title" data-app-title>Code Web</div>
         <div class="page-subtitle"><span class="desktop-session-badge" id="desktopSessionBadge">会话初始化中</span> · <span class="desktop-transport-badge" id="desktopTransportBadge">连接中</span> · <span class="page-version" data-version>vdev</span></div>
       </div>
     </header>
@@ -84,10 +81,18 @@
     <main class="phone-shell">
       <header class="topbar">
         <div class="title-stack">
-          <div class="page-title">Codex Web</div>
+          <div class="page-title" data-app-title>Code Web</div>
           <div class="page-subtitle"><span id="sessionBadge">会话初始化中</span> · <span id="transportBadge">连接中</span> · <span class="page-version" data-version>vdev</span></div>
         </div>
       </header>
+
+      <section id="connectionBanner" class="connection-banner" hidden>
+        <div class="connection-banner-head">
+          <span id="connectionBadge" class="connection-badge">connected</span>
+          <span id="connectionTitle" class="connection-title">连接正常</span>
+        </div>
+        <div id="connectionDetail" class="connection-detail">实时事件会显示在这里。</div>
+      </section>
 
       <section id="timeline" class="timeline" aria-live="polite"></section>
 
@@ -131,11 +136,11 @@
     </article>
   </template>
 
-  <script src="/app/state.js"></script>
-  <script src="/app/render.js"></script>
-  <script src="/app/runtime.js"></script>
-  <script src="/app/transport.js"></script>
-  <script src="/app/commands.js"></script>
-  <script src="/app/bootstrap.js"></script>
+  <script src="/app/state.js?v=__ASSET_VERSION__"></script>
+  <script src="/app/render.js?v=__ASSET_VERSION__"></script>
+  <script src="/app/runtime.js?v=__ASSET_VERSION__"></script>
+  <script src="/app/transport.js?v=__ASSET_VERSION__"></script>
+  <script src="/app/commands.js?v=__ASSET_VERSION__"></script>
+  <script src="/app/bootstrap.js?v=__ASSET_VERSION__"></script>
 </body>
 </html>

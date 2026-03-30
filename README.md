@@ -2,66 +2,89 @@
   中文 | <a href="./README.en.md">English</a>
 </p>
 
-# codex-web
+# <p align="center">Code Web</p>
 
-`codex-web` 是一个基于 `Go + HTML + WebSocket` 的 Codex Web UI。
+<p align="center">
+  <img alt="Go Version" src="https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white">
+  <img alt="Version" src="https://img.shields.io/badge/version-v1.1.1-111827">
+  <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/klsf/code-web?style=social">
+</p>
+<p align="center">
+  中文 | <a href="./README.en.md">English</a>
+</p>
+`Code Web` 是一个基于 `Go + HTML + WebSocket` 构建的代码助手 Web UI，目前支持 `Codex` 和 `Claude`。
 
-它面向移动端和桌面浏览器，提供接近 Codex CLI 的连续会话体验：
+它面向移动端和桌面浏览器，目标是把本地代码助手 CLI 的连续会话体验搬到浏览器里：
 
 - 浏览器关闭后，任务继续在服务端执行
 - 重新打开页面后，自动恢复最新聊天内容
-- 同一个会话会复用同一个 Codex thread，保留上下文
 
 ## 界面截图
 
-### 桌面端
-
-![桌面端截图](./screen1.png)
-
-### 移动端
-
-![移动端截图](./screen2.png)
+<img alt="桌面端截图" width="500" src="./screen1.png" />
+<img alt="移动端截图" height="252" src="./screen2.png" />
 
 ## 特性
 
-- 基于 `codex app-server`，不是每条消息都重新跑一次独立 CLI
-- 会话持久化到 `data/sessions/*.json`
+- `codex` 模式基于 `codex app-server`，不是每条消息都重新启动一次独立 CLI
+- 支持通过 `Claude` headless CLI 执行并续接会话
+- 会话不再落盘到服务端，本地浏览器会保存远端会话引用用于恢复
 - 支持图片随消息一起发送
-- 支持流式输出、`Working...` 状态行、自动重连
+- 支持流式输出、`Working...` 状态提示和自动重连
 - 支持基础 Markdown 渲染
-- 前端静态资源内嵌进 Go 二进制
-
-## 当前支持的命令
-
-- `/status`
-- `/model`
-- `/fast`
-- `/skills`
-- `/resume`
-- `/clear`
-- `/compact`
-- `/stop`
-- `/delete`
-- `/new`
-- `/logout`
-
-其中一部分命令是本地 UI 命令，一部分会调用后端接口或 `codex app-server`。
+- 前端静态资源已打包进二进制，无需额外携带 `static/` 目录
 
 ## 运行要求
 
 1. Go `1.22+`
-2. 机器上可直接执行 `codex`
-   Windows 下需要确保 `codex.exe`（或对应 shim）已加入 `PATH`
-3. 已完成 `codex login`
+2. 机器上可直接执行对应 provider 的 CLI
+    - `codex` 模式：需要 `codex`
+    - `claude` 模式：需要 `claude`
+3. 如果使用 `codex` 模式，还需要先完成 `codex login`
+
+## 配置文件
+
+程序默认从二进制所在工作目录读取这两个配置文件：
+
+- `claude-settings.json`
+    - claude会话的配置，可以通过 `claude-settings.json` 配置环境变量，如代理、模型等
+- `codex-settings.json`
+    - 当前用于给 `codex app-server` 注入额外环境变量
+
+`claude-settings.json` 格式示例：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "ms-******-ba92-4416-*****-d93c1124a9f9",
+    "ANTHROPIC_BASE_URL": "https://api-inference.modelscope.cn",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ZhipuAI/GLM-5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "ZhipuAI/GLM-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "ZhipuAI/GLM-5",
+    "ANTHROPIC_MODEL": "ZhipuAI/GLM-5"
+  }
+}
+```
+
+`codex-settings.json` 格式示例：
+
+```json
+{
+  "env": {
+    "HTTP_PROXY": "http://127.0.0.1:10808",
+    "HTTPS_PROXY": "http://127.0.0.1:10808"
+  }
+}
+```
 
 ## 启动
 
 ```bash
-go build -o codex-web .
-./codex-web
+go build -o code-web 
+./code-web
 ```
 
-构建后的 `codex-web` 二进制已经包含前端静态资源，部署时只需要二进制本体，以及运行期会写入的 `data/` 目录。
+部署时只需要保留二进制本体，以及运行期间会写入的 `data/` 目录。
 
 默认监听：
 
@@ -69,20 +92,12 @@ go build -o codex-web .
 0.0.0.0:991
 ```
 
-默认会尝试连接：
-
-```text
-ws://127.0.0.1:8765
-```
-
-也就是本机上的 `codex app-server`。
-
 ## 登录密码
 
 可通过启动参数设置登录密码：
 
 ```bash
-./codex-web -password "123456"
+./code-web -password "123456"
 ```
 
 如果没有指定，默认密码是：
@@ -98,31 +113,6 @@ codex
 ```text
 http://你的服务器IP:991
 ```
-
-登录成功后：
-
-- 如果浏览器本地保存的 `sessionId` 仍然存在，会直接进入该会话
-- 如果本地没有会话，或者会话已经被删除，会进入“新建会话 / 恢复会话”页面
-
-## 工作目录
-
-新建会话时可以输入工作目录，例如：
-
-```text
-/home/codex
-```
-
-这个目录会按 session 保存，并影响：
-
-- `/status` 里的 `cwd`
-- 后续 Codex 对话所在目录
-- `thread/start` / `thread/resume` 的 `cwd`
-- `/review` 这类依赖工作目录的任务
-
-## 数据目录
-
-- 会话数据：`data/sessions/`
-- 上传图片：`data/uploads/`
 
 ## 反向代理
 
@@ -141,9 +131,9 @@ location / {
 ## 说明
 
 - 这个项目不是官方 OpenAI 产品
-- 它是一个面向个人部署的 Codex Web 外壳
+- 它是一个面向个人部署的 Codex / Claude Web 外壳
 - 当前实现优先保证连续会话、恢复能力和移动端可用性
 
 ## License
 
-本项目使用 `MIT` 许可证，见 [LICENSE](/www/codex/LICENSE)。
+本项目使用 `MIT` 许可证，见 [LICENSE](./LICENSE)。
