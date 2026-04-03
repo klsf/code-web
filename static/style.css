@@ -124,6 +124,7 @@ body.auth-required {
     radial-gradient(circle at top, rgba(255, 255, 255, 0.08), transparent 55%),
     linear-gradient(180deg, #111115 0%, #0b0b0d 100%);
   color: var(--text);
+  appearance: none;
   cursor: pointer;
   transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
 }
@@ -193,11 +194,21 @@ body.auth-required {
   width: 100%;
   height: 46px;
   margin-top: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 0;
   border-radius: 14px;
   background: linear-gradient(180deg, var(--blue) 0%, var(--blue-2) 100%);
   color: #fff;
   font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  appearance: none;
+}
+
+.auth-link-button {
+  text-decoration: none;
 }
 
 .login-button-secondary {
@@ -250,6 +261,38 @@ body.auth-required {
   text-align: center;
 }
 
+.auth-link-panel {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid #24242a;
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at top right, rgba(64, 93, 205, 0.14), transparent 42%),
+    linear-gradient(180deg, #101115 0%, #090a0d 100%);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+}
+
+.auth-link-title {
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.auth-link-anchor {
+  color: #8fb0ff;
+  text-decoration: underline;
+  word-break: break-all;
+}
+
+.auth-link-url {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-all;
+}
+
 .resume-list {
   display: grid;
   gap: 10px;
@@ -271,13 +314,18 @@ body.auth-required {
 
 .resume-open {
   width: 100%;
+  display: block;
   padding: 14px 14px 12px;
   padding-right: 42px;
   border: 0;
   border-radius: 14px;
   background: transparent;
   color: var(--text);
+  font: inherit;
+  line-height: 1.4;
   text-align: left;
+  cursor: pointer;
+  appearance: none;
 }
 
 .resume-open:hover {
@@ -292,14 +340,20 @@ body.auth-required {
   position: absolute;
   top: 8px;
   right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 24px;
   height: 24px;
   border: 0;
+  padding: 0;
   border-radius: 999px;
   background: #17171b;
   color: #9b9ba1;
   font-size: 16px;
   line-height: 1;
+  cursor: pointer;
+  appearance: none;
 }
 
 .resume-item-title {
@@ -481,7 +535,6 @@ body.auth-required {
   color: #9ca4b8;
   font-size: 12px;
   line-height: 1.5;
-}
 }
 
 .login-error {
@@ -1070,12 +1123,19 @@ body.auth-required {
   position: absolute;
   top: 4px;
   right: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 20px;
   height: 20px;
   border: 0;
+  padding: 0;
   border-radius: 50%;
   background: rgba(0, 0, 0, 0.72);
   color: #fff;
+  line-height: 1;
+  cursor: pointer;
+  appearance: none;
 }
 
 .composer {
@@ -1096,7 +1156,7 @@ body.auth-required {
 
 .composer-main {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 8px;
   min-width: 0;
 }
@@ -1106,13 +1166,19 @@ body.auth-required {
   height: 38px;
   flex: 0 0 38px;
   border: 0;
+  padding: 0;
   border-radius: 50%;
   background: linear-gradient(180deg, var(--blue) 0%, var(--blue-2) 100%);
   color: #fff;
   font-size: 18px;
+  font-family: inherit;
+  line-height: 1;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  align-self: flex-end;
+  cursor: pointer;
+  appearance: none;
   transition: background 0.18s ease, color 0.18s ease, opacity 0.18s ease;
 }
 
@@ -1124,6 +1190,17 @@ body.auth-required {
   stroke-width: 1.8;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+#imageBtn {
+  background: #1a1a1f;
+  border: 1px solid #2a2d36;
+  color: #dce4f8;
+}
+
+#imageBtn:hover:not(:disabled),
+#imageBtn:focus-visible:not(:disabled) {
+  background: #20232b;
 }
 
 .round-icon:disabled {
@@ -1143,15 +1220,16 @@ body.auth-required {
 
 textarea {
   flex: 1;
-  min-height: 24px;
+  min-height: 38px;
   max-height: 132px;
   border: 0;
   outline: none;
+  padding: 8px 0 6px;
   resize: none;
   background: #121214;
   color: var(--text);
   font: inherit;
-  line-height: 1.6;
+  line-height: 1.45;
 }
 
 .bubble-images {

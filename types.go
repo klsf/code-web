@@ -30,7 +30,7 @@ const (
 	appServerRetryMaxDelay = 30 * time.Second
 	staleTaskIdle          = 45 * time.Second
 	authCookieName         = "codex_web_auth"
-	appVersion             = "1.1.1"
+	appVersion             = "1.1.2"
 )
 
 var defaultWorkdir = "."
@@ -108,6 +108,7 @@ type sessionStore struct {
 	maxConcurrent int
 	taskSlots     chan struct{}
 	authToken     string
+	accountStatus map[string]cachedAccountStatus
 }
 
 type clientEvent struct {
@@ -145,19 +146,20 @@ type restoreSessionRequest struct {
 }
 
 type statusResponse struct {
-	RestoreRef        *restoreRef     `json:"restoreRef,omitempty"`
-	Provider          string          `json:"provider"`
-	Model             string          `json:"model"`
-	Cwd               string          `json:"cwd"`
-	SessionID         string          `json:"sessionId"`
-	CodexThreadID     string          `json:"codexThreadId,omitempty"`
-	ProviderSessionID string          `json:"providerSessionId,omitempty"`
-	Transport         string          `json:"transport"`
-	Task              string          `json:"task"`
-	ApprovalPolicy    string          `json:"approvalPolicy"`
-	ServiceTier       string          `json:"serviceTier,omitempty"`
-	FastMode          bool            `json:"fastMode"`
-	RateLimits        *rateLimitsData `json:"rateLimits,omitempty"`
+	RestoreRef        *restoreRef        `json:"restoreRef,omitempty"`
+	Provider          string             `json:"provider"`
+	Model             string             `json:"model"`
+	Cwd               string             `json:"cwd"`
+	SessionID         string             `json:"sessionId"`
+	CodexThreadID     string             `json:"codexThreadId,omitempty"`
+	ProviderSessionID string             `json:"providerSessionId,omitempty"`
+	Transport         string             `json:"transport"`
+	Task              string             `json:"task"`
+	ApprovalPolicy    string             `json:"approvalPolicy"`
+	ServiceTier       string             `json:"serviceTier,omitempty"`
+	FastMode          bool               `json:"fastMode"`
+	Account           *accountStatusData `json:"account,omitempty"`
+	RateLimits        *rateLimitsData    `json:"rateLimits,omitempty"`
 }
 
 type modelsResponse struct {
@@ -312,6 +314,19 @@ type rateLimitsData struct {
 	Credits   *rateCredits      `json:"credits"`
 	PlanType  string            `json:"planType"`
 	Extra     map[string]string `json:"-"`
+}
+
+type accountStatusData struct {
+	LoggedIn   bool   `json:"loggedIn"`
+	Method     string `json:"method,omitempty"`
+	Detail     string `json:"detail,omitempty"`
+	Identifier string `json:"identifier,omitempty"`
+	Name       string `json:"name,omitempty"`
+}
+
+type cachedAccountStatus struct {
+	Data      *accountStatusData
+	CheckedAt time.Time
 }
 
 type rateWindow struct {

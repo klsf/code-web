@@ -94,13 +94,9 @@ newSessionChoice.addEventListener("click", async function () {
   try {
     resumeEmpty.hidden = true;
     var nextProvider = currentProvider;
-    if (providerRequiresAuthFor(nextProvider)) {
-      setCurrentProvider(nextProvider);
-      var authStatus = await checkCodexAuthStatus().catch(function () { return { loggedIn: true }; });
-      if (!authStatus.loggedIn) {
-        showCodexAuthScreen("当前机器上的 Codex 尚未授权，或授权已失效。");
-        return;
-      }
+    setCurrentProvider(nextProvider);
+    if (!(await ensureProviderAuth(nextProvider, "当前机器上的 Codex 尚未授权，或授权已失效。"))) {
+      return;
     }
     await createSession(workdirInput.value, false, nextProvider);
     enterApp();
@@ -108,45 +104,6 @@ newSessionChoice.addEventListener("click", async function () {
     resumeEmpty.hidden = false;
     resumeEmpty.textContent = err && err.message ? err.message : "新建会话失败";
     showError(err && err.message ? err.message : "新建会话失败");
-  }
-});
-
-codexAuthComplete.addEventListener("click", async function () {
-  try {
-    var data = await submitCodexAuthCallback(codexAuthInput.value);
-    if (data.loggedIn) {
-      showError("验证成功，正在进入会话");
-      await openSessionChooser();
-      return;
-    }
-  } catch (err) {
-    showError(err && err.message ? err.message : "提交回调链接失败");
-  }
-});
-
-document.addEventListener("click", async function (evt) {
-  var button = evt.target && evt.target.closest ? evt.target.closest("#codexAuthLink") : null;
-  if (!button) return;
-  try {
-    button.disabled = true;
-    var data = await openCodexAuthLink(false);
-    if (data && data.session && data.session.id) {
-      currentCodexAuthSessionId = data.session.id;
-    }
-    if (data.loggedIn) {
-      await openSessionChooser();
-      return;
-    }
-    var authUrl = data && data.session && data.session.authUrl;
-    if (!authUrl) {
-      showError((data.session && data.session.error) || "当前没有可用的授权链接，请重试。");
-      return;
-    }
-    window.open(authUrl, "_blank", "noopener,noreferrer");
-  } catch (err) {
-    showError(err && err.message ? err.message : "生成授权链接失败");
-  } finally {
-    button.disabled = false;
   }
 });
 

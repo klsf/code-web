@@ -313,7 +313,6 @@ async function logout() {
 function enterApp() {
   hideSessionChooser();
   hideLoginScreen();
-  hideCodexAuthScreen();
   autoResize();
   renderAttachmentTray();
   updateSendState();
@@ -345,12 +344,8 @@ async function boot() {
   var matched = saved ? items.find(function (item) { return item && item.id === saved; }) : null;
   if (matched) {
     setCurrentProvider(matched.provider || currentProvider);
-    if (providerRequiresAuthFor(currentProvider)) {
-      var codexAuth = await checkCodexAuthStatus().catch(function () { return { loggedIn: true }; });
-      if (!codexAuth.loggedIn) {
-        showCodexAuthScreen("当前机器上的 Codex 尚未授权，或授权已失效。");
-        return;
-      }
+    if (!(await ensureProviderAuth(currentProvider, "当前机器上的 Codex 尚未授权，或授权已失效。"))) {
+      return;
     }
     setSession(matched.id);
     enterApp();
@@ -359,12 +354,8 @@ async function boot() {
   var savedRef = getCurrentSessionRef() || findSessionRefByLocalSessionId(saved);
   if (savedRef) {
     try {
-      if (providerRequiresAuthFor(savedRef.provider)) {
-        var savedRefAuth = await checkCodexAuthStatus().catch(function () { return { loggedIn: true }; });
-        if (!savedRefAuth.loggedIn) {
-          showCodexAuthScreen("当前机器上的 Codex 尚未授权，或授权已失效。");
-          return;
-        }
+      if (!(await ensureProviderAuth(savedRef.provider, "当前机器上的 Codex 尚未授权，或授权已失效。"))) {
+        return;
       }
       await restoreSessionWithRetry(savedRef, false, { attempts: 4, delayMs: 1200 });
       enterApp();

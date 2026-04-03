@@ -1,12 +1,13 @@
 (function () {
   var defaultAuthGuideSteps = [
-    "点击下面按钮，会在新页面打开 ChatGPT 登录授权。",
+    "点击下面按钮1，会在新页面打开 ChatGPT 登录授权。",
     "在新页面完成授权，浏览器会跳转到一个 http://localhost:1455/auth/callback?... 链接。",
     "复制完整回调链接，回到当前页面粘贴，然后点击“完成授权”。",
   ];
 
   var pollTimer = null;
   var currentSessionId = "";
+  var returnTo = "/";
 
   function authGuideSteps() {
     var config = window.__APP_CONFIG || {};
@@ -19,12 +20,37 @@
     return document.getElementById(id);
   }
 
+  function resolveReturnTo() {
+    var params = new URLSearchParams(window.location.search || "");
+    var value = String(params.get("returnTo") || "/").trim();
+    if (!value || !value.startsWith("/")) {
+      return "/";
+    }
+    return value;
+  }
+
+  function sleep(ms) {
+    return new Promise(function (resolve) {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  function apiPayload(json) {
+    if (!json || typeof json !== "object") return {};
+    if (!Object.prototype.hasOwnProperty.call(json, "data")) return json;
+    return json.data || {};
+  }
+
   async function readJSON(response) {
     var data = await response.json().catch(function () { return null; });
     if (!response.ok) {
-      throw new Error((data && data.session && data.session.error) || "请求失败");
+      var payload = apiPayload(data);
+      throw new Error((payload && payload.session && payload.session.error) || (data && data.message) || "请求失败");
     }
-    return data || {};
+    if (data && typeof data.status === "number" && data.status !== 0) {
+      throw new Error(data.message || "请求失败");
+    }
+    return apiPayload(data);
   }
 
   function renderSteps() {
@@ -70,28 +96,47 @@
     return readJSON(response);
   }
 
+  async function waitForAuthReady(sessionId, timeoutMs) {
+    var deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    while (Date.now() < deadline) {
+      await sleep(400);
+      var data = await fetchStatus().catch(function () { return null; });
+      if (!data) {
+        continue;
+      }
+      if (data.loggedIn) {
+        return data;
+      }
+      var session = data.session || {};
+      if (sessionId && session.id && session.id !== sessionId) {
+        continue;
+      }
+      if (session.authUrl || session.error || (session.status && session.status !== "pending")) {
+        return data;
+      }
+    }
+    return null;
+  }
+
   function renderStatus(data) {
     if (!data) return;
-    if (data.loggedIn) {
-      var openButton = getEl("openAuth");
-      if (openButton) {
-        openButton.disabled = true;
-      }
-      return;
-    }
-
     var session = data.session || {};
     if (session.id) {
       currentSessionId = session.id;
     }
   }
 
+  function goBackToApp() {
+    window.location.href = returnTo;
+  }
+
   async function openAuth() {
     var button = getEl("openAuth");
     if (!button) return;
 
-    var keepDisabled = false;
-    button.disabled = true;
+    var originalText = button.textContent;
+    button.dataset.loading = "1";
+    button.textContent = "正在获取授权链接...";
     try {
       var response = await fetch("/api/codex-auth/start?restart=1", {
         method: "POST",
@@ -100,13 +145,15 @@
       var data = await readJSON(response);
       renderStatus(data);
 
-      if (data.loggedIn) {
-        keepDisabled = true;
-        alert("当前设备已登录。");
-        return;
-      }
-
       var authUrl = data && data.session && data.session.authUrl;
+      if (!authUrl && data && data.session && data.session.status === "pending") {
+        var waited = await waitForAuthReady(currentSessionId, 8000);
+        if (waited) {
+          data = waited;
+          renderStatus(data);
+          authUrl = data && data.session && data.session.authUrl;
+        }
+      }
       if (!authUrl) {
         alert((data.session && data.session.error) || "当前没有可用的授权链接，请重试。");
         return;
@@ -116,7 +163,8 @@
     } catch (err) {
       alert("生成授权链接失败。");
     } finally {
-      button.disabled = keepDisabled;
+      delete button.dataset.loading;
+      button.textContent = originalText;
       ensurePolling();
     }
   }
@@ -144,8 +192,9 @@
       renderStatus(data);
 
       if (data.loggedIn) {
-        alert("验证成功，请返回 Code Web。");
+        alert("验证成功，正在返回 Code Web。");
         stopPolling();
+        goBackToApp();
         return;
       }
 
@@ -171,6 +220,7 @@
         renderStatus(data);
         if (data.loggedIn) {
           stopPolling();
+          goBackToApp();
         }
       } catch (err) {
       }
@@ -178,15 +228,24 @@
   }
 
   async function init() {
+    returnTo = resolveReturnTo();
     renderSteps();
     var completeButton = getEl("completeAuth");
     if (completeButton) {
       completeButton.addEventListener("click", completeAuth);
     }
+    var backButton = getEl("backToApp");
+    if (backButton) {
+      backButton.addEventListener("click", goBackToApp);
+    }
 
     try {
       var data = await fetchStatus();
       renderStatus(data);
+      if (data.loggedIn) {
+        goBackToApp();
+        return;
+      }
       if (!data.loggedIn && data.session && data.session.id) {
         ensurePolling();
       }

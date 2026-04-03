@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	authURLPattern     = regexp.MustCompile(`https://auth\.openai\.com/\S+`)
+	urlPattern         = regexp.MustCompile(`https?://[^\s"'<>]+`)
 	loginServerPattern = regexp.MustCompile(`https?://localhost:\d+`)
 	ansiRegex          = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 )
@@ -32,6 +32,7 @@ var authGuideSteps = []string{
 
 const codexAuthSessionTTL = 15 * time.Minute
 const codexLoginStatusCacheTTL = 3 * time.Second
+const codexAuthStartWait = 5 * time.Second
 
 func newCodexAuthManager() *codexAuthManager {
 	return &codexAuthManager{}
@@ -65,6 +66,84 @@ func (m *codexAuthManager) loginStatus(force bool) (bool, string) {
 
 func stripANSI(text string) string {
 	return ansiRegex.ReplaceAllString(text, "")
+}
+
+func trimDetectedURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), ".,);]}>")
+}
+
+func extractAuthURL(text string) (string, string) {
+	for _, raw := range urlPattern.FindAllString(text, -1) {
+		candidate := trimDetectedURL(raw)
+		parsed, err := url.Parse(candidate)
+		if err != nil {
+			continue
+		}
+		host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+		if host == "" || host == "localhost" || host == "127.0.0.1" {
+			continue
+		}
+		query := parsed.Query()
+		state := strings.TrimSpace(query.Get("state"))
+		if state == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(query.Get("response_type")), "code") ||
+			strings.TrimSpace(query.Get("code_challenge")) != "" ||
+			strings.Contains(strings.ToLower(parsed.Path), "/oauth/authorize") {
+			return candidate, state
+		}
+	}
+	return "", ""
+}
+
+func extractCallbackURL(text string) string {
+	for _, raw := range urlPattern.FindAllString(text, -1) {
+		candidate := trimDetectedURL(raw)
+		parsed, err := url.Parse(candidate)
+		if err != nil {
+			continue
+		}
+		host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+		if host != "localhost" && host != "127.0.0.1" {
+			continue
+		}
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		if parsed.Path == "" || parsed.Path == "/" {
+			parsed.Path = "/auth/callback"
+			return parsed.String()
+		}
+		if strings.HasSuffix(parsed.Path, "/auth/callback") {
+			return parsed.String()
+		}
+	}
+	if match := loginServerPattern.FindString(text); match != "" {
+		return trimDetectedURL(match) + "/auth/callback"
+	}
+	return ""
+}
+
+func populateAuthSessionFromText(session *codexAuthSession, text string) {
+	if session == nil {
+		return
+	}
+	if session.AuthURL == "" {
+		if authURL, state := extractAuthURL(text); authURL != "" {
+			session.AuthURL = authURL
+			if session.State == "" {
+				session.State = state
+			}
+		}
+	}
+	if session.Callback == "" {
+		if callback := extractCallbackURL(text); callback != "" {
+			session.Callback = callback
+		}
+	}
+	if session.AuthURL != "" && session.Status == "pending" {
+		session.Status = "ready"
+	}
 }
 
 func codexLoginStatus() (bool, string) {
@@ -246,9 +325,10 @@ func (m *codexAuthManager) EnsureStarted(ctx context.Context, restart bool) code
 		authLog.Error().Str("session_id", session.ID).Str("error", session.Error).Msg("auth session failed")
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(codexAuthStartWait)
 	for time.Now().Before(deadline) {
 		m.mu.Lock()
+		populateAuthSessionFromText(session, transcript.String())
 		ready := session.AuthURL != ""
 		copySession := *session
 		m.mu.Unlock()
@@ -272,22 +352,7 @@ func (m *codexAuthManager) captureAuthStream(session *codexAuthSession, r io.Rea
 		}
 		transcript.WriteString(line + "\n")
 		m.mu.Lock()
-		if session.AuthURL == "" {
-			if match := authURLPattern.FindString(line); match != "" {
-				session.AuthURL = match
-				if parsed, err := url.Parse(match); err == nil {
-					session.State = strings.TrimSpace(parsed.Query().Get("state"))
-				}
-			}
-		}
-		if session.Callback == "" {
-			if match := loginServerPattern.FindString(line); match != "" {
-				session.Callback = match + "/auth/callback"
-			}
-		}
-		if session.AuthURL != "" && session.Status == "pending" {
-			session.Status = "ready"
-		}
+		populateAuthSessionFromText(session, line)
 		m.mu.Unlock()
 	}
 }

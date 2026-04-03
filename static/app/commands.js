@@ -4,29 +4,27 @@ commands = [
     hideCommandPalette();
     var res = await fetch("/api/status?sessionId=" + encodeURIComponent(currentSessionId));
     var data = await apiJSON(res);
-    var content = "";
-    if ((data.provider || currentProvider || "unknown") === "codex") {
-      content = JSON.stringify(data, null, 2);
-    } else {
-      var lines = [
-        "provider: " + (data.provider || currentProvider || "unknown"),
-        "model: " + data.model,
-        "cwd: " + data.cwd,
-        "session: " + shortSession(data.sessionId || currentSessionId),
-        "transport: " + data.transport,
-        "task: " + data.task,
-        "approvals: " + (data.approvalPolicy || "never"),
-        "fast: " + (data.fastMode ? "on" : "off"),
-        "service tier: " + (data.serviceTier || "default"),
-      ];
-      if (data.rateLimits) {
-        lines.push("plan: " + (data.rateLimits.planType || "unknown"));
-        if (data.rateLimits.primary) lines.push("primary: " + remainText(data.rateLimits.primary));
-        if (data.rateLimits.secondary) lines.push("secondary: " + remainText(data.rateLimits.secondary));
-        if (data.rateLimits.credits) lines.push("credits: " + creditText(data.rateLimits.credits));
-      }
-      content = lines.join("\n");
+    var lines = [
+      "provider: " + (data.provider || currentProvider || "unknown"),
+      "model: " + data.model,
+      "cwd: " + data.cwd,
+      "session: " + shortSession(data.sessionId || currentSessionId),
+      "transport: " + data.transport,
+      "task: " + data.task,
+      "approvals: " + (data.approvalPolicy || "never"),
+      "fast: " + (data.fastMode ? "on" : "off"),
+      "service tier: " + (data.serviceTier || "default"),
+    ];
+    if (data.account) {
+      lines.push("account: " + accountSummary(data.account));
     }
+    if (data.rateLimits) {
+      lines.push("plan: " + (data.rateLimits.planType || "unknown"));
+      if (data.rateLimits.primary) lines.push("primary: " + remainText(data.rateLimits.primary));
+      if (data.rateLimits.secondary) lines.push("secondary: " + remainText(data.rateLimits.secondary));
+      if (data.rateLimits.credits) lines.push("credits: " + creditText(data.rateLimits.credits));
+    }
+    var content = lines.join("\n");
     renderMessage({ id: "status-" + Date.now(), role: "system", content: content, createdAt: new Date().toISOString() }, { animate: false });
   }},
   { name: "/skills", aliases: [":skills"], description: "快速选择可用 skills", action: async function () {
@@ -413,6 +411,22 @@ async function selectDeleteSession(item) {
   input.value = "";
   autoResize();
   renderMessage({ id: "delete-" + Date.now(), role: "system", content: "已删除会话 " + shortSession(item.id), createdAt: new Date().toISOString() }, { animate: false });
+}
+
+function accountSummary(account) {
+  if (!account) return "unknown";
+  var parts = [account.loggedIn ? "logged in" : "not logged in"];
+  if (account.method) {
+    parts.push("via " + account.method);
+  } else if (account.detail) {
+    parts.push("via " + account.detail);
+  }
+  if (account.identifier) {
+    parts.push(account.name ? "(" + account.name + " <" + account.identifier + ">)" : "(" + account.identifier + ")");
+  } else if (account.name) {
+    parts.push("(" + account.name + ")");
+  }
+  return parts.join(" ");
 }
 
 commands.forEach(function (item) {

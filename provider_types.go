@@ -29,6 +29,7 @@ type Provider interface {
 	CompactSession(*sessionStore, string) (bool, error)
 	ListModels(context.Context, *sessionStore, string) ([]modelInfo, error)
 	ReadRateLimits(context.Context, *sessionStore) (*rateLimitsData, error)
+	ReadAccountStatus(context.Context, *sessionStore) (*accountStatusData, error)
 }
 
 type providerBase struct {

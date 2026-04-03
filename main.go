@@ -44,8 +44,9 @@ func main() {
 	}
 
 	store := &sessionStore{
-		sessions: make(map[string]*sessionRuntime),
-		auth:     newCodexAuthManager(),
+		sessions:      make(map[string]*sessionRuntime),
+		auth:          newCodexAuthManager(),
+		accountStatus: make(map[string]cachedAccountStatus),
 		meta: appMeta{
 			Provider:       activeProvider.ID(),
 			Model:          detectCodexModel(),

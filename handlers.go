@@ -172,11 +172,12 @@ func (s *sessionStore) handleCodexAuthPage(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "codex auth page not found", http.StatusInternalServerError)
 		return
 	}
+	html := strings.ReplaceAll(string(content), "__ASSET_VERSION__", assetVersion)
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(content)
+	_, _ = w.Write([]byte(html))
 }
 
 func (s *sessionStore) handleCodexAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -185,10 +186,10 @@ func (s *sessionStore) handleCodexAuthStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if _, ok := availableProviders[providerCodex]; !ok {
-		writeAPIJSON(w, codexAuthStatusResponse{LoggedIn: true})
+		writeJSON(w, codexAuthStatusResponse{LoggedIn: true})
 		return
 	}
-	writeAPIJSON(w, s.auth.Status())
+	writeJSON(w, s.auth.Status())
 }
 
 func (s *sessionStore) handleCodexAuthStart(w http.ResponseWriter, r *http.Request) {
@@ -202,7 +203,22 @@ func (s *sessionStore) handleCodexAuthStart(w http.ResponseWriter, r *http.Reque
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	writeAPIJSON(w, s.auth.EnsureStarted(ctx, codexAuthRestart(r.URL.Query().Get("restart"))))
+	resp := s.auth.EnsureStarted(ctx, codexAuthRestart(r.URL.Query().Get("restart")))
+	sessionID := ""
+	status := ""
+	hasAuthURL := false
+	if resp.Session != nil {
+		sessionID = strings.TrimSpace(resp.Session.ID)
+		status = strings.TrimSpace(resp.Session.Status)
+		hasAuthURL = strings.TrimSpace(resp.Session.AuthURL) != ""
+	}
+	authLog.Info().
+		Str("session_id", sessionID).
+		Bool("logged_in", resp.LoggedIn).
+		Str("status", status).
+		Bool("has_auth_url", hasAuthURL).
+		Msg("auth start response")
+	writeJSON(w, resp)
 }
 
 func (s *sessionStore) handleCodexAuthComplete(w http.ResponseWriter, r *http.Request) {
@@ -262,23 +278,26 @@ func (s *sessionStore) handleCodexAuthComplete(w http.ResponseWriter, r *http.Re
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if loggedIn, _ := s.auth.loginStatus(true); loggedIn {
-			if s.app != nil {
-				s.resetSessionThreads()
-				restartErr := s.app.Restart(ctx, "Codex 登录账号已切换，当前任务已中断")
-				if restartErr != nil {
-					appLog.Error().Str("session", current.ID).Err(restartErr).Msg("auth complete restart failed")
-					writeAPIError(w, http.StatusInternalServerError, "codex app-server restart failed", nil)
-					return
-				}
-			}
 			appLog.Info().Str("session", current.ID).Msg("auth complete confirmed")
-			writeAPIJSON(w, s.auth.Status())
+			writeJSON(w, s.auth.Status())
+			if s.app != nil {
+				go func(sessionID string) {
+					restartCtx, restartCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer restartCancel()
+					s.resetSessionThreads()
+					if err := s.app.Restart(restartCtx, "Codex 登录账号已切换，当前任务已中断"); err != nil {
+						appLog.Error().Str("session", sessionID).Err(err).Msg("auth complete async restart failed")
+						return
+					}
+					appLog.Info().Str("session", sessionID).Msg("auth complete async restart finished")
+				}(current.ID)
+			}
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	appLog.Warn().Str("session", current.ID).Msg("auth complete pending after callback")
-	writeAPIJSON(w, s.auth.Status())
+	writeJSON(w, s.auth.Status())
 }
 
 func (s *sessionStore) handleCodexAuthCallback(w http.ResponseWriter, r *http.Request) {
@@ -496,6 +515,20 @@ func (s *sessionStore) handleStatus(w http.ResponseWriter, r *http.Request) {
 			if session.ActiveTaskID != "" {
 				resp.Task = "running"
 			}
+		}
+	}
+
+	accountCtx, accountCancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer accountCancel()
+	if account, err := s.readAccountStatus(accountCtx, resp.Provider); err == nil {
+		resp.Account = account
+	}
+
+	if providerForID(resp.Provider).SupportsRateLimits() {
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+		if limits, err := providerForID(resp.Provider).ReadRateLimits(ctx, s); err == nil {
+			resp.RateLimits = limits
 		}
 	}
 

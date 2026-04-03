@@ -422,7 +422,6 @@ function showLoginScreen() {
   document.body.classList.add("auth-required");
   loginScreen.hidden = false;
   sessionChooser.hidden = true;
-  codexAuthScreen.hidden = true;
   loginError.textContent = "";
   timeline.innerHTML = "";
   removeWorkingPlaceholder();
@@ -442,7 +441,6 @@ function hideLoginScreen() {
 function showSessionChooser() {
   document.body.classList.add("auth-required");
   sessionChooser.hidden = false;
-  codexAuthScreen.hidden = true;
   resumeList.hidden = true;
   resumeList.innerHTML = "";
   resumeEmpty.hidden = true;
@@ -458,98 +456,25 @@ function hideSessionChooser() {
 }
 
 function buildCodexAuthLink() {
-  return "/codex-auth";
-}
-
-function authGuideStepsConfig() {
-  var config = window.__APP_CONFIG || {};
-  return Array.isArray(config.authGuideSteps) ? config.authGuideSteps : [];
-}
-
-async function submitCodexAuthCallback(callbackUrl) {
-  var res = await fetch("/api/codex-auth/complete", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId: currentCodexAuthSessionId, callbackUrl: String(callbackUrl || "").trim() }),
-  });
-  var data = await res.json();
-  if (!res.ok && (!data || !data.session || !data.session.error)) {
-    throw new Error("提交回调链接失败");
-  }
-  return data;
-}
-
-async function openCodexAuthLink() {
-  var params = new URLSearchParams();
-  params.set("restart", "1");
-  var query = "?" + params.toString();
-  var res = await fetch("/api/codex-auth/start" + query, { method: "POST", credentials: "same-origin" });
-  var data = await res.json();
-  if (!res.ok) {
-    throw new Error((data && data.session && data.session.error) || "生成授权链接失败");
-  }
-  return data;
-}
-
-function renderAuthGuide(container, buttonId, buttonClass) {
-  if (!container) return;
-  var steps = authGuideStepsConfig();
-  container.innerHTML = "";
-  steps.forEach(function (text, index) {
-    var row = document.createElement("div");
-    row.className = "resume-item auth-guide-item";
-    var buttonHtml = index === 0
-      ? '<div class="auth-guide-launch"><button id="' + buttonId + '" class="' + buttonClass + '" type="button">打开授权页面</button></div>'
-      : "";
-    row.innerHTML = '<div class="resume-open resume-open-static">' +
-      '<div class="resume-item-title">步骤 ' + (index + 1) + '</div>' +
-      '<div class="resume-item-desc">' + text + '</div>' +
-      buttonHtml +
-      '</div>';
-    container.appendChild(row);
-  });
+  var query = new URLSearchParams();
+  query.set("returnTo", window.location.pathname || "/");
+  return "/codex-auth?" + query.toString();
 }
 
 async function showCodexAuthScreen(message) {
-  document.body.classList.add("auth-required");
-  codexAuthScreen.hidden = false;
-  loginScreen.hidden = true;
-  sessionChooser.hidden = true;
-  if (authTitle) authTitle.textContent = "ChatGPT 账户验证";
-  if (authIntro) {
-    authIntro.textContent = message || ("当前机器上的 " + providerDisplayName() + " 尚未完成 ChatGPT 账户验证，或验证已失效。");
-  }
-  currentCodexAuthSessionId = "";
-  renderAuthGuide(codexAuthSteps, "codexAuthLink", "login-button login-button-compact");
-  if (codexAuthInput) codexAuthInput.value = "";
-  codexAuthLink = document.getElementById("codexAuthLink");
-  if (codexAuthHint) {
-    codexAuthHint.textContent = "";
-  }
-  var status = await checkCodexAuthStatus().catch(function () { return null; });
-  if (status && status.loggedIn) {
-    if (codexAuthLink) {
-      codexAuthLink.disabled = true;
-      codexAuthLink.textContent = "当前设备已登录";
-    }
-    if (codexAuthHint) {
-      codexAuthHint.textContent = "";
-    }
-    return;
-  }
-  if (status && status.session) {
-    if (status.session.id) {
-      currentCodexAuthSessionId = status.session.id;
-    }
-    if (codexAuthHint && status.session.error) {
-      codexAuthHint.textContent = "";
-    }
-  }
+  window.location.href = buildCodexAuthLink();
 }
 
-function hideCodexAuthScreen() {
-  codexAuthScreen.hidden = true;
+async function ensureProviderAuth(providerID, message) {
+  if (!providerRequiresAuthFor(providerID)) {
+    return true;
+  }
+  var authStatus = await checkCodexAuthStatus().catch(function () { return { loggedIn: true }; });
+  if (authStatus.loggedIn) {
+    return true;
+  }
+  showCodexAuthScreen(message || "当前机器上的 Codex 尚未授权，或授权已失效。");
+  return false;
 }
 
 function isCodexAuthError(message) {
