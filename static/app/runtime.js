@@ -1,74 +1,3 @@
-function appConfig() {
-  return window.__APP_CONFIG || {};
-}
-
-function providerDisplayName() {
-  var current = String(currentProvider || "").trim().toLowerCase();
-  var matched = availableProviders().find(function (item) {
-    return item && String(item.id || "").trim().toLowerCase() === current;
-  });
-  if (matched && matched.displayName) {
-    return String(matched.displayName).trim();
-  }
-  return String(appConfig().providerName || currentProvider || "Code").trim();
-}
-
-function setNodeText(node, value) {
-  if (!node) return;
-  node.textContent = value;
-}
-
-function providerRequiresAuth() {
-  return Boolean(appConfig().requiresAuth);
-}
-
-function providerRequiresAuthFor(providerID) {
-  return String(providerID || "").toLowerCase() === "codex";
-}
-
-function providerSupportsFast() {
-  return String(currentProvider || "").toLowerCase() === "codex";
-}
-
-function providerSupportsCompact() {
-  return String(currentProvider || "").toLowerCase() === "codex";
-}
-
-function availableProviders() {
-  return Array.isArray(appConfig().providers) ? appConfig().providers : [];
-}
-
-function providerSessionStorageKeys() {
-  return ["codex_session_id", "sessionId", "sessionid"];
-}
-
-function clearStoredSession() {
-  providerSessionStorageKeys().forEach(function (key) {
-    localStorage.removeItem(key);
-    sessionStorage.removeItem(key);
-  });
-}
-
-function sessionRefsStorageKey() {
-  return "code_web_session_refs";
-}
-
-function currentSessionRefStorageKey() {
-  return "code_web_current_session_ref";
-}
-
-function sessionCacheStorageKey() {
-  return "code_web_session_cache";
-}
-
-function parseJSONSafe(raw, fallback) {
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    return fallback;
-  }
-}
-
 function apiPayload(json) {
   if (!json || typeof json !== "object") return {};
   if (!Object.prototype.hasOwnProperty.call(json, "data")) return json;
@@ -78,774 +7,412 @@ function apiPayload(json) {
 async function apiJSON(res) {
   var json = await res.json().catch(function () { return null; });
   if (!res.ok) {
-    var message = json && json.message ? json.message : (await res.text().catch(function () { return ""; }));
+    var message = json && json.message ? json.message : "请求失败";
     throw new Error(message || "请求失败");
-  }
-  if (json && typeof json.status === "number" && json.status !== 0) {
-    throw new Error(json.message || "请求失败");
   }
   return apiPayload(json);
 }
 
-function loadSessionRefs() {
-  var items = parseJSONSafe(localStorage.getItem(sessionRefsStorageKey()) || "[]", []);
-  return Array.isArray(items) ? items.filter(function (item) { return item && item.provider; }) : [];
+async function checkAuth() {
+  var res = await fetch("/api/auth", { credentials: "same-origin" });
+  var data = await apiJSON(res);
+  return Boolean(data.authenticated);
 }
 
-function loadSessionCache() {
-  var items = parseJSONSafe(localStorage.getItem(sessionCacheStorageKey()) || "{}", {});
-  return items && typeof items === "object" ? items : {};
-}
-
-function saveSessionCache(items) {
-  localStorage.setItem(sessionCacheStorageKey(), JSON.stringify(items && typeof items === "object" ? items : {}));
-}
-
-function saveSessionRefs(items) {
-  localStorage.setItem(sessionRefsStorageKey(), JSON.stringify(Array.isArray(items) ? items : []));
-}
-
-function sessionRefIdentity(item) {
-  if (!item) return "";
-  if (item.restoreRef && typeof item.restoreRef === "object") {
-    return sessionRefIdentity(item.restoreRef);
+async function submitLogin(password) {
+  var res = await fetch("/api/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ password: password })
+  });
+  if (!res.ok) {
+    throw new Error("密码错误");
   }
-  var provider = String(item.provider || "").trim().toLowerCase();
-  var remote = String(item.codexThreadId || item.providerSessionId || item.refId || item.id || "").trim();
-  if (!provider || !remote) return "";
-  return provider + "|" + remote;
 }
 
-function normalizeSessionRef(ref) {
-  if (!ref) return null;
-  var source = ref && ref.restoreRef && typeof ref.restoreRef === "object" ? ref.restoreRef : ref;
-  var provider = String(source.provider || "").trim().toLowerCase();
-  var codexThreadId = String(source.codexThreadId || "").trim();
-  var providerSessionId = String(source.providerSessionId || "").trim();
-  if (!provider || (!codexThreadId && !providerSessionId)) return null;
-  return {
-    refId: String(source.refId || sessionRefIdentity({ provider: provider, codexThreadId: codexThreadId, providerSessionId: providerSessionId })).trim(),
-    localSessionId: String(source.localSessionId || source.sessionId || ref.localSessionId || ref.sessionId || "").trim(),
-    provider: provider,
-    model: String(source.model || ref.model || "").trim(),
-    workdir: String(source.workdir || source.cwd || ref.workdir || ref.cwd || "").trim(),
-    codexThreadId: codexThreadId,
-    providerSessionId: providerSessionId,
-    updatedAt: ref.updatedAt || source.updatedAt || new Date().toISOString(),
-    lastMessage: String(ref.lastMessage || source.lastMessage || "").trim(),
-    lastEvent: String(ref.lastEvent || source.lastEvent || "").trim(),
-    messageCount: Number(ref.messageCount || source.messageCount || 0),
-    running: Boolean(ref.running || source.running)
+async function fetchSessions() {
+  var res = await fetch("/api/sessions", { credentials: "same-origin" });
+  var data = await apiJSON(res);
+  return Array.isArray(data.items) ? data.items : [];
+}
+
+async function submitLogout() {
+  var res = await fetch("/api/logout", {
+    method: "POST",
+    credentials: "same-origin"
+  });
+  if (!res.ok) {
+    throw new Error("退出登录失败");
+  }
+}
+
+async function deleteSession(item) {
+  var res = await fetch("/api/session/delete", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: item && item.restoreRef ? "" : item.id,
+      provider: item ? item.provider : "",
+      restoreRef: item && item.restoreRef ? item.restoreRef : null
+    })
+  });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  if (item && item.id && item.id === currentSessionId) {
+    localStorage.removeItem("sessionId");
+    currentSessionId = "";
+  }
+}
+
+async function createSession(workdir, connectNow, providerID) {
+  var nextProvider = String(providerID || currentProvider || "claude").trim().toLowerCase();
+  var res = await fetch("/api/session/new", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: nextProvider, workdir: String(workdir || "").trim() })
+  });
+  var data = await apiJSON(res);
+  setCurrentProvider(nextProvider);
+  setSession(data.sessionId || "");
+  populateModelSelect(nextProvider);
+  replaceTimeline([], [], null);
+  setTaskState(false);
+  closeSocket();
+  if (connectNow !== false) {
+    ensureSocket();
+  }
+  return data.sessionId || "";
+}
+
+async function restoreSession(item, connectNow) {
+  var restoreRef = item && item.restoreRef ? item.restoreRef : {
+    provider: item.provider,
+    providerSessionId: item.providerSessionID || item.providerSessionId || item.id
   };
-}
-
-function upsertSessionRef(ref) {
-  var normalized = normalizeSessionRef(ref);
-  if (!normalized) return null;
-  var items = loadSessionRefs();
-  var key = normalized.refId;
-  var existing = items.find(function (item) { return sessionRefIdentity(item) === key; }) || null;
-  var merged = existing ? {
-    refId: normalized.refId,
-    localSessionId: normalized.localSessionId || existing.localSessionId || "",
-    provider: normalized.provider,
-    model: normalized.model || existing.model || "",
-    workdir: normalized.workdir || existing.workdir || "",
-    codexThreadId: normalized.codexThreadId || existing.codexThreadId || "",
-    providerSessionId: normalized.providerSessionId || existing.providerSessionId || "",
-    updatedAt: normalized.updatedAt || existing.updatedAt || new Date().toISOString(),
-    lastMessage: normalized.lastMessage || existing.lastMessage || "",
-    lastEvent: normalized.lastEvent || existing.lastEvent || "",
-    messageCount: normalized.messageCount || existing.messageCount || 0,
-    running: normalized.running
-  } : normalized;
-  var nextItems = items.filter(function (item) { return sessionRefIdentity(item) !== key; });
-  nextItems.unshift(merged);
-  saveSessionRefs(nextItems.slice(0, 50));
-  localStorage.setItem(currentSessionRefStorageKey(), JSON.stringify(merged));
-  return merged;
-}
-
-function removeSessionRef(refLike) {
-  var key = sessionRefIdentity(refLike) || String(refLike || "").trim();
-  if (!key) return;
-  var removedKeys = [];
-  var nextItems = loadSessionRefs().filter(function (item) {
-    var normalized = normalizeSessionRef(item);
-    var shouldKeep = sessionRefIdentity(item) !== key &&
-      String(item.refId || "") !== key &&
-      String((normalized && normalized.localSessionId) || "").trim() !== key;
-    if (!shouldKeep) {
-      var identity = sessionRefIdentity(item);
-      if (identity) removedKeys.push(identity);
-    }
-    return shouldKeep;
+  var res = await fetch("/api/session/restore", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: restoreRef.provider, sessionId: restoreRef.providerSessionId, restoreRef: restoreRef })
   });
-  saveSessionRefs(nextItems);
-  var currentRef = getCurrentSessionRef();
-  if (currentRef && (sessionRefIdentity(currentRef) === key || String(currentRef.localSessionId || "").trim() === key)) {
-    localStorage.removeItem(currentSessionRefStorageKey());
+  var data = await apiJSON(res);
+  setCurrentProvider(restoreRef.provider || currentProvider);
+  setSession(data.sessionId || "");
+  populateModelSelect(restoreRef.provider || currentProvider, item && item.model);
+  replaceTimeline([], [], null);
+  setTaskState(false);
+  closeSocket();
+  if (connectNow !== false) {
+    ensureSocket();
   }
-  var cache = loadSessionCache();
-  removedKeys.concat([key]).forEach(function (cacheKey) {
-    if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) {
-      delete cache[cacheKey];
-    }
-  });
-  saveSessionCache(cache);
 }
 
-function getCurrentSessionRef() {
-  return normalizeSessionRef(parseJSONSafe(localStorage.getItem(currentSessionRefStorageKey()) || "null", null));
+function closeSocket() {
+  clearTimeout(reconnectTimer);
+  if (!ws) return;
+  var current = ws;
+  ws = null;
+  wsIntentionalClose = true;
+  try {
+    current.close();
+  } catch (err) {}
 }
 
-function findSessionRefByLocalSessionId(sessionId) {
-  var target = String(sessionId || "").trim();
-  if (!target) return null;
-  var items = loadSessionRefs();
-  for (var i = 0; i < items.length; i += 1) {
-    var item = normalizeSessionRef(items[i]);
-    if (item && String(item.localSessionId || "").trim() === target) {
-      return item;
-    }
-  }
-  return null;
-}
-
-function setCurrentSessionRef(ref) {
-  var normalized = normalizeSessionRef(ref);
-  if (!normalized) {
-    localStorage.removeItem(currentSessionRefStorageKey());
+function ensureSocket() {
+  clearTimeout(reconnectTimer);
+  if (!currentSessionId) return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
-  localStorage.setItem(currentSessionRefStorageKey(), JSON.stringify(normalized));
+  connect();
 }
 
-function storedSessionList() {
-  return loadSessionRefs().map(function (item) {
-    return {
-      id: "ref:" + item.refId,
-      localSessionId: item.localSessionId,
-      provider: item.provider,
-      model: item.model,
-      workdir: item.workdir,
-      codexThreadId: item.codexThreadId,
-      providerSessionId: item.providerSessionId,
-      updatedAt: item.updatedAt,
-      lastMessage: item.lastMessage,
-      lastEvent: item.lastEvent,
-      messageCount: item.messageCount,
-      running: item.running,
-      restoreRef: item,
-      isStoredRef: true
-    };
+function connect() {
+  clearTimeout(reconnectTimer);
+  if (!currentSessionId) return;
+
+  var protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  wsIntentionalClose = false;
+  ws = new WebSocket(protocol + "//" + location.host + "/ws");
+  var socket = ws;
+  setTransportState("connecting");
+
+  socket.addEventListener("open", function () {
+    if (ws !== socket) return;
+    setTransportState("connected");
+    setConnectionBanner("connecting", "握手已建立，正在同步会话快照。");
+    socket.send(JSON.stringify({ type: "hello", sessionId: currentSessionId }));
+  });
+
+  socket.addEventListener("message", function (evt) {
+    if (ws !== socket) return;
+    var data = JSON.parse(evt.data);
+    if (data.type === "snapshot" && data.session) {
+      setSession(data.session.id);
+      setMeta({ provider: data.session.provider, model: data.session.model, cwd: data.session.workdir });
+      replaceTimeline(data.session.messages || [], data.session.events || [], data.session.draftMessage || null);
+      setTaskState(Boolean(data.running));
+      setConnectionBanner("connected", "已连接到 " + shortSession(data.session.id) + "，实时消息同步正常。");
+      return;
+    }
+    if (data.type === "message" && data.message) {
+      renderMessage(data.message);
+      return;
+    }
+    if (data.type === "message_delta" && data.message) {
+      removeDraftMessages();
+      renderMessage(data.message, { draft: true });
+      setFooterStatus("working", providerDisplayName() + " 正在输出");
+      return;
+    }
+    if (data.type === "message_final" && data.message) {
+      removeDraftMessages(data.message.id);
+      renderMessage(data.message);
+      setFooterStatus("ready", "本轮回复已完成");
+      return;
+    }
+    if (data.type === "log" && data.log) {
+      renderEvent(data.log);
+      return;
+    }
+    if (data.type === "task_status") {
+      setTaskState(Boolean(data.running));
+      return;
+    }
+    if (data.type === "error" && data.error) {
+      setTaskState(false);
+      showError(data.error);
+    }
+  });
+
+  socket.addEventListener("close", function () {
+    if (ws === socket) {
+      ws = null;
+    }
+    if (wsIntentionalClose) {
+      wsIntentionalClose = false;
+      return;
+    }
+    setTransportState("reconnecting");
+    setConnectionBanner("reconnecting", "实时连接已断开，1.5 秒后自动重试。");
+    reconnectTimer = setTimeout(connect, 1500);
+  });
+
+  socket.addEventListener("error", function () {
+    if (ws !== socket) return;
+    setTransportState("error");
+    setConnectionBanner("error", "WebSocket 连接异常，稍后会继续尝试恢复。");
   });
 }
 
-function rememberSessionRef(ref) {
-  return upsertSessionRef(ref);
-}
+async function sendPrompt() {
+  var content = String(input.value || "").trim();
+  var hasImages = pendingImages.length > 0;
+  if ((!content && !hasImages) || !currentSessionId || isRunning) return;
 
-function rememberSessionSnapshot(session, meta) {
-  if (!session) return null;
-  var ref = rememberSessionRef(session.restoreRef || {
-    localSessionId: session.id,
-    provider: session.provider || (meta && meta.provider) || currentProvider,
-    model: session.model || (meta && meta.model) || "",
-    workdir: session.workdir || (meta && meta.cwd) || "",
-    codexThreadId: session.codexThreadId,
-    providerSessionId: session.providerSessionId,
-    updatedAt: session.updatedAt || new Date().toISOString(),
-    lastMessage: resumeSummary({ lastMessage: lastUserMessageText(session.messages || []) }),
-    lastEvent: resumeSummary({ lastEvent: lastEventText(session.events || []) }),
-    messageCount: Array.isArray(session.messages) ? session.messages.length : 0,
-    running: Boolean(session.activeTaskId)
+  var formData = new FormData();
+  formData.append("sessionId", currentSessionId);
+  formData.append("content", content);
+  formData.append("model", String(modelSelect && modelSelect.value || "").trim());
+  pendingImages.forEach(function (item) {
+    formData.append("images", item.file, item.file.name);
   });
-  if (ref) {
-    var cache = loadSessionCache();
-    cache[ref.refId] = {
-      updatedAt: session.updatedAt || new Date().toISOString(),
-      messages: Array.isArray(session.messages) ? session.messages : [],
-      events: Array.isArray(session.events) ? session.events : [],
-      draftMessage: session.draftMessage || null
-    };
-    var keys = Object.keys(cache).sort(function (a, b) {
-      var left = cache[a] && cache[a].updatedAt ? new Date(cache[a].updatedAt).getTime() : 0;
-      var right = cache[b] && cache[b].updatedAt ? new Date(cache[b].updatedAt).getTime() : 0;
-      return right - left;
-    }).slice(0, 20);
-    var trimmed = {};
-    keys.forEach(function (key) {
-      trimmed[key] = cache[key];
+
+  ensureSocket();
+  setTaskState(true);
+  setFooterStatus("working", compact(content || ("已附加 " + pendingImages.length + " 张图片")));
+
+  try {
+    var res = await fetch("/api/send", { method: "POST", credentials: "same-origin", body: formData });
+    if (!res.ok) {
+      throw new Error(await res.text());
+    }
+    input.value = "";
+    pendingImages.forEach(function (item) {
+      URL.revokeObjectURL(item.url);
     });
-    saveSessionCache(trimmed);
-  }
-  return ref;
-}
-
-function getSessionCache(refLike) {
-  var key = sessionRefIdentity(refLike) || String(refLike || "").trim();
-  if (!key) return null;
-  var cache = loadSessionCache();
-  return cache[key] || null;
-}
-
-function lastUserMessageText(messages) {
-  for (var i = (messages || []).length - 1; i >= 0; i--) {
-    var item = messages[i];
-    if (item && item.role === "user" && item.content) return item.content;
-  }
-  return "";
-}
-
-function lastEventText(events) {
-  for (var i = (events || []).length - 1; i >= 0; i--) {
-    var item = events[i];
-    if (item && (item.target || item.body || item.title)) return item.target || item.body || item.title;
-  }
-  return "";
-}
-
-function providerIcon(providerID, displayName) {
-  var id = String(providerID || "").trim().toLowerCase();
-  if (id === "claude") {
-    return '' +
-      '<svg viewBox="0 0 48 48" aria-hidden="true">' +
-        '<circle cx="24" cy="24" r="10"></circle>' +
-        '<path d="M24 5v7M24 36v7M5 24h7M36 24h7M11 11l5 5M32 32l5 5M11 37l5-5M32 16l5-5"></path>' +
-      '</svg>';
-  }
-  return '' +
-    '<svg viewBox="0 0 48 48" aria-hidden="true">' +
-      '<path d="M34 12c-2.5-3-6-4.5-10.5-4.5C14.4 7.5 8 13.7 8 24s6.4 16.5 15.5 16.5c4.5 0 8-1.5 10.5-4.5"></path>' +
-      '<path d="M30 16h8v16h-8"></path>' +
-      '<path d="M22 16a8 8 0 1 0 0 16"></path>' +
-    '</svg>';
-}
-
-function connectionStateCopy(state) {
-  switch (String(state || "").toLowerCase()) {
-    case "connecting":
-      return { badge: "link", title: "正在建立连接", detail: "正在与当前会话建立实时通道。" };
-    case "reconnecting":
-      return { badge: "retry", title: "正在恢复连接", detail: "实时连接已断开，系统会自动重试并尽量恢复原会话。" };
-    case "restoring":
-      return { badge: "restore", title: "正在恢复远端会话", detail: "正在用已保存的 restore ref 重建会话上下文。" };
-    case "error":
-      return { badge: "error", title: "连接异常", detail: "实时通道暂不可用，可稍后重试或重新恢复会话。" };
-    default:
-      return { badge: "live", title: "连接正常", detail: "实时事件和消息流会显示在这里。" };
+    pendingImages = [];
+    renderAttachmentTray();
+    autoResize();
+    updateSendState();
+  } catch (err) {
+    setTaskState(false);
+    showError(err && err.message ? err.message : "发送失败");
   }
 }
 
-function setConnectionBanner(state, detail) {
-  if (!connectionBanner || !connectionBadge || !connectionTitle || !connectionDetail) return;
-  var next = connectionStateCopy(state);
-  connectionBanner.hidden = String(state || "").toLowerCase() === "connected";
-  connectionBanner.dataset.state = String(state || "connected").toLowerCase();
-  connectionBadge.textContent = next.badge;
-  connectionTitle.textContent = next.title;
-  connectionDetail.textContent = String(detail || next.detail || "").trim();
-}
-
-function sessionKindLabel(item) {
-  if (!item) return "live";
-  if (item.isStoredRef || item.restoreRef) return "restored";
-  return "live";
-}
-
-function sessionMetaChips(item) {
-  var chips = [];
-  if (item && item.updatedAt) chips.push("更新 " + formatTime(item.updatedAt));
-  if (item && item.messageCount) chips.push("消息 " + item.messageCount);
-  if (item && item.workdir) chips.push(compact(item.workdir));
-  if (item && item.restoreRef) chips.push("含缓存");
-  if (item && item.running) chips.push("运行中");
-  return chips.slice(0, 4);
-}
-
-function syncProviderPicker() {
-  if (!providerPicker) return;
-  var buttons = providerPicker.querySelectorAll("[data-provider-id]");
-  Array.from(buttons).forEach(function (button) {
-    var selected = String(button.dataset.providerId || "") === String(currentProvider || "");
-    button.classList.toggle("is-selected", selected);
-    button.setAttribute("aria-checked", selected ? "true" : "false");
-  });
-}
-
-function setCurrentProvider(providerID) {
+async function switchProvider(providerID) {
   var nextProvider = String(providerID || "").trim().toLowerCase();
-  if (!nextProvider) return;
-  currentProvider = nextProvider;
-  syncProviderPicker();
+  if (!nextProvider || nextProvider === currentProvider) {
+    syncProviderPicker();
+    syncChooserProviderPicker();
+    return;
+  }
+  if (isRunning) {
+    syncProviderPicker();
+    syncChooserProviderPicker();
+    showError("当前会话仍在生成中，请稍候切换");
+    return;
+  }
+
+  setCurrentProvider(nextProvider);
+  if (!sessionChooser.hidden) {
+    return;
+  }
+
+  closeSocket();
+  setTransportState("connecting");
+  renderEmpty();
+
+  try {
+    await createSession(statusCwd.textContent || workdirInput.value, true, nextProvider);
+    setFooterStatus("ready", "已切换到 " + providerDisplayName(nextProvider));
+  } catch (err) {
+    showError(err && err.message ? err.message : "切换会话失败");
+  }
 }
 
-function populateProviderSelect() {
-  if (!providerPicker) return;
-  var items = availableProviders().filter(function (item) { return item && item.available; });
-  providerPicker.innerHTML = "";
-  items.forEach(function (item) {
-    var button = document.createElement("button");
-    button.type = "button";
-    button.className = "provider-option";
-    button.dataset.providerId = item.id;
-    button.setAttribute("role", "radio");
-    button.setAttribute("aria-label", item.displayName);
-    button.innerHTML =
-      '<span class="provider-option-icon">' + providerIcon(item.id, item.displayName) + '</span>' +
-      '<span class="provider-option-name">' + item.displayName + '</span>';
-    button.addEventListener("click", function () {
-      setCurrentProvider(item.id);
-    });
-    providerPicker.appendChild(button);
+function enterApp() {
+  hideLoginScreen();
+  hideSessionChooser();
+  autoResize();
+  updateSendState();
+  ensureSocket();
+}
+
+async function backToSessionChooser() {
+  if (isRunning) {
+    showError("当前会话仍在生成中，请稍候返回");
+    return;
+  }
+  closeSocket();
+  await openSessionChooser();
+}
+
+async function quickCreateSession() {
+  if (isRunning) {
+    showError("当前会话仍在生成中，请稍候新建");
+    return;
+  }
+  hideSessionModal();
+  await backToSessionChooser();
+}
+
+async function openSessionChooser() {
+  hideLoginScreen();
+  showSessionChooser();
+  var items = await fetchSessions().catch(function () { return []; });
+  resumeSessionChoice.dataset.items = JSON.stringify(items);
+  resumeSessionChoice.disabled = items.length === 0;
+  resumeEmpty.hidden = items.length > 0;
+}
+
+async function openSessionModal() {
+  var items = await fetchSessions().catch(function () { return []; });
+  resumeEmpty.hidden = items.length > 0;
+  if (!items.length) {
+    showError("没有可恢复的历史会话");
+    return;
+  }
+  renderResumeList(items, {
+    onOpen: async function (item) {
+      hideSessionModal();
+      closeSocket();
+      replaceTimeline([], [], null);
+      setTaskState(false);
+      if (item && item.restoreRef) {
+        await restoreSession(item, false);
+      } else {
+        setCurrentProvider(item.provider || currentProvider);
+        setSession(item.id);
+        populateModelSelect(item.provider || currentProvider, item.model);
+      }
+      enterApp();
+    },
+    onDelete: async function (item, row) {
+      await deleteSession(item);
+      row.remove();
+      if (!resumeList.children.length) {
+        hideSessionModal();
+      }
+    }
   });
-  var defaultItem = items.find(function (item) { return item.isDefault; }) || items[0];
-  if (defaultItem && !items.some(function (item) { return item.id === currentProvider; })) {
-    currentProvider = defaultItem.id;
+  showSessionModal();
+}
+
+async function logoutAndReset() {
+  closeSocket();
+  try {
+    await submitLogout();
+  } catch (err) {
+    showError(err && err.message ? err.message : "退出登录失败");
+    return;
   }
-  syncProviderPicker();
+
+  localStorage.removeItem("sessionId");
+  currentSessionId = "";
+  pendingImages.forEach(function (item) {
+    URL.revokeObjectURL(item.url);
+  });
+  pendingImages = [];
+  renderAttachmentTray();
+  input.value = "";
+  autoResize();
+  updateSendState();
+  replaceTimeline([], [], null);
+  setTaskState(false);
+  setTransportState("connecting");
+  setSession("");
+  setMeta({
+    provider: appConfig().provider || currentProvider,
+    model: appConfig().model || "unknown",
+    cwd: "/"
+  });
+  hideSessionModal();
+  hideActionModal();
+  showLoginScreen();
 }
 
-function setTransportState(state) {
-  setNodeText(transportBadge, state);
-  setNodeText(desktopTransportBadge, state);
-  setNodeText(statusTransport, state);
-  setConnectionBanner(state);
-  if (!isRunning) {
-    setFooterStatus(state === "connected" ? "ready" : state, transportDetail(state));
+async function tryRestoreSavedSession() {
+  var saved = String(currentSessionId || "").trim();
+  if (!saved) {
+    return false;
   }
-}
-
-function showLoginScreen() {
-  isAuthenticated = false;
-  document.body.classList.add("auth-required");
-  loginScreen.hidden = false;
-  sessionChooser.hidden = true;
-  loginError.textContent = "";
-  timeline.innerHTML = "";
-  removeWorkingPlaceholder();
-  setTimeout(function () {
-    passwordInput.focus();
-  }, 0);
-}
-
-function hideLoginScreen() {
-  isAuthenticated = true;
-  document.body.classList.remove("auth-required");
-  loginScreen.hidden = true;
-  loginError.textContent = "";
-  passwordInput.value = "";
-}
-
-function showSessionChooser() {
-  document.body.classList.add("auth-required");
-  sessionChooser.hidden = false;
-  resumeList.hidden = true;
-  resumeList.innerHTML = "";
-  resumeEmpty.hidden = true;
-  setConnectionBanner("connected");
-}
-
-function hideSessionChooser() {
-  document.body.classList.remove("auth-required");
-  sessionChooser.hidden = true;
-  resumeList.hidden = true;
-  resumeList.innerHTML = "";
-  resumeEmpty.hidden = true;
-}
-
-function buildCodexAuthLink() {
-  var query = new URLSearchParams();
-  query.set("returnTo", window.location.pathname || "/");
-  return "/codex-auth?" + query.toString();
-}
-
-async function showCodexAuthScreen(message) {
-  window.location.href = buildCodexAuthLink();
-}
-
-async function ensureProviderAuth(providerID, message) {
-  if (!providerRequiresAuthFor(providerID)) {
+  var items = await fetchSessions().catch(function () { return []; });
+  var liveMatch = items.find(function (item) { return item && String(item.id || "") === saved && !item.restoreRef; });
+  if (liveMatch) {
+    setCurrentProvider(liveMatch.provider || currentProvider);
+    setSession(liveMatch.id);
+    enterApp();
     return true;
   }
-  var authStatus = await checkCodexAuthStatus().catch(function () { return { loggedIn: true }; });
-  if (authStatus.loggedIn) {
-    return true;
-  }
-  showCodexAuthScreen(message || "当前机器上的 Codex 尚未授权，或授权已失效。");
   return false;
 }
 
-function isCodexAuthError(message) {
-  var text = String(message || "").toLowerCase();
-  return text.includes("not logged in") ||
-    text.includes("codex login") ||
-    text.includes("authentication") ||
-    text.includes("unauthorized") ||
-    text.includes("login required") ||
-    text.includes("logged out") ||
-    text.includes("expired");
-}
-
-function setTaskState(running) {
-  isRunning = running;
-  imageBtn.disabled = running;
-  updateSendState();
-  setNodeText(statusTask, running ? "running" : "idle");
-  if (running) {
-    setFooterStatus("Working", providerDisplayName() + " 正在执行任务，可输入 /stop 终止");
-    input.placeholder = "发送消息...";
-    return;
-  }
-  setFooterStatus(transportBadge.textContent === "connected" ? "ready" : transportBadge.textContent, "等待输入");
-  input.placeholder = "发送消息...";
-}
-
-function setSession(id) {
-  currentSessionId = id;
-  localStorage.setItem("codex_session_id", id);
-  localStorage.setItem("sessionId", id);
-  localStorage.setItem("sessionid", id);
-  setNodeText(sessionBadge, id.slice(0, 8));
-  setNodeText(desktopSessionBadge, id.slice(0, 8));
-  setNodeText(statusSession, shortSession(id));
-}
-
-function setMeta(meta) {
-  if (!meta) return;
-  if (meta.provider) {
-    setCurrentProvider(meta.provider);
-    setNodeText(statusProvider, meta.provider);
-  }
-  if (meta.model) setNodeText(modelBadge, meta.model);
-  if (meta.cwd) setNodeText(cwdBadge, meta.cwd);
-  if (meta.model) setNodeText(statusModel, meta.model);
-  if (meta.cwd) setNodeText(statusCwd, meta.cwd);
-  setNodeText(statusApprovals, meta.approvalPolicy || (statusApprovals && statusApprovals.textContent) || "never");
-  setNodeText(statusFast, meta.fastMode ? "on" : "off");
-  setNodeText(statusServiceTier, meta.serviceTier || "default");
-}
-
-function autoResize() {
-  input.style.height = "auto";
-  input.style.height = Math.min(input.scrollHeight, 132) + "px";
-}
-
-function updateSendState() {
-  var hasContent = String(input.value || "").trim().length > 0;
-  var hasImages = pendingImages.length > 0;
-  var commandToken = commandQuery(input.value || "");
-  var exactCommand = commands.find(function (item) {
-    return item.name === commandToken || (item.aliases || []).includes(commandToken);
-  });
-  var canSubmitWhileRunning = Boolean(exactCommand && exactCommand.name === "/stop");
-  sendBtn.disabled = (isRunning && !canSubmitWhileRunning) || (!hasContent && !hasImages);
-}
-
-function canAcceptImageFile(file) {
-  return Boolean(file && typeof file.type === "string" && file.type.toLowerCase().startsWith("image/"));
-}
-
-function addPendingImageFiles(files) {
-  var added = false;
-  (files || []).forEach(function (file) {
-    if (!canAcceptImageFile(file)) {
-      return;
-    }
-    pendingImages.push({
-      file: file,
-      url: URL.createObjectURL(file),
-    });
-    added = true;
-  });
-  if (!added) {
-    return false;
-  }
+async function boot() {
+  applyBuildInfo();
+  populateModelSelect(currentProvider, appConfig().model);
+  autoResize();
   renderAttachmentTray();
   updateSendState();
-  return true;
-}
-
-function compact(text) {
-  return String(text || "").replace(/\s+/g, " ").trim().slice(0, 120) || "等待输入";
-}
-
-function applyBuildInfo() {
-  var config = appConfig();
-  var version = String(config.version || "dev").trim();
-  if (!version) version = "dev";
-  if (version.charAt(0) !== "v") {
-    version = "v" + version;
+  renderEmpty();
+  if (workdirInput) {
+    workdirInput.value = statusCwd.textContent && statusCwd.textContent !== "/" ? statusCwd.textContent : "H:\\go\\code-web-new";
   }
-  document.title = String(config.appName || "Code Web").trim() || "Code Web";
-  Array.from(appTitleNodes || []).forEach(function (node) {
-    node.textContent = String(config.appName || "Code Web").trim() || "Code Web";
-  });
-  Array.from(versionNodes || []).forEach(function (node) {
-    node.textContent = version;
-  });
-  populateProviderSelect();
-}
 
-function showError(message) {
-  var text = compact(message || "操作失败");
-  setFooterStatus("error", text);
-  if (providerRequiresAuth() && isCodexAuthError(text)) {
-    showCodexAuthScreen(providerDisplayName() + " 授权已失效，请重新授权。");
-  }
-  if (!errorToast) {
+  var authenticated = await checkAuth().catch(function () { return false; });
+  if (!authenticated) {
+    showLoginScreen();
     return;
   }
-  errorToast.textContent = text;
-  errorToast.hidden = false;
-  clearTimeout(errorToastTimer);
-  errorToastTimer = setTimeout(function () {
-    errorToast.hidden = true;
-  }, 3200);
-}
 
-function shouldRenderMarkdown(message) {
-  return Boolean(message && message.role === "assistant");
-}
-
-function renderMarkdown(node, text) {
-  var bubble = node.querySelector(".bubble");
-  var source = String(text || "");
-  var markedLib = window.marked;
-  var purifier = window.DOMPurify;
-  if (!markedLib || !purifier) {
-    bubble.textContent = source;
+  hideLoginScreen();
+  if (await tryRestoreSavedSession()) {
     return;
   }
-  markedLib.setOptions({
-    breaks: true,
-    gfm: true,
-  });
-  var html = markedLib.parse(source);
-  bubble.innerHTML = purifier.sanitize(html);
-}
-
-function firstLine(text) {
-  return String(text || "").split("\n")[0];
-}
-
-function transportDetail(state) {
-  if (state === "connected") return "等待输入";
-  if (state === "connecting") return "正在建立连接";
-  if (state === "reconnecting") return "正在恢复连接";
-  return "连接不可用";
-}
-
-function formatTime(value) {
-  if (!value) return "--:--";
-  return new Date(value).toLocaleString("zh-CN", {
-    hour12: false,
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function formatReset(ts) {
-  if (!ts) return "unknown";
-  return new Date(ts * 1000).toLocaleString("zh-CN", {
-    hour12: false,
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function remainText(windowData) {
-  var used = Number(windowData.usedPercent || 0);
-  var remain = Math.max(0, 100 - used);
-  return remain + "% left, used " + used + "%, reset " + formatReset(windowData.resetsAt);
-}
-
-function creditText(credits) {
-  if (credits.unlimited) return "unlimited";
-  if (credits.hasCredits && credits.balance != null) return String(credits.balance);
-  return "none";
-}
-
-async function checkCodexAuthStatus() {
-  if (!providerRequiresAuth()) {
-    return { loggedIn: true };
-  }
-  var res = await fetch("/api/codex-auth/status", { credentials: "same-origin" });
-  return apiJSON(res);
-}
-
-function setFooterStatus(state, detail) {
-  renderFooterState(state);
-  if (detail != null) {
-    footerDetail.textContent = detail;
-  }
-}
-
-function renderFooterState(state) {
-  var text = String(state || "").trim() || "ready";
-  footerState.textContent = "";
-  footerState.classList.toggle("is-animated", text.toLowerCase() === "working");
-  if (text.toLowerCase() !== "working") {
-    footerState.textContent = text;
-    return;
-  }
-  var wrap = document.createElement("span");
-  wrap.className = "working-text working-marquee";
-  Array.from(text).forEach(function (char, index) {
-    var node = document.createElement("span");
-    node.className = "working-char";
-    node.style.animationDelay = (index * 0.12) + "s";
-    node.textContent = char;
-    wrap.appendChild(node);
-  });
-  footerState.appendChild(wrap);
-}
-
-function ensureWorkingPlaceholder() {
-  return;
-}
-
-function removeWorkingPlaceholder() {
-  return;
-}
-
-function shortSession(id) {
-  return id ? String(id).slice(0, 8) : "unknown";
-}
-
-function resumeSummary(item) {
-  var parts = [];
-  if (item && item.provider) parts.push(String(item.provider));
-  if (item.running) parts.push("运行中");
-  parts.push(compact(item.workdir || "") || "无工作目录");
-  if (item.lastMessage) {
-    parts.push(compact(item.lastMessage));
-  } else if (item.lastEvent) {
-    parts.push(compact(item.lastEvent));
-  } else {
-    parts.push("无消息记录");
-  }
-  parts.push(Number(item.messageCount || 0) + " 条消息");
-  parts.push(item.updatedAt ? formatTime(item.updatedAt) : "--:--");
-  return parts.join(" · ");
-}
-
-function resumeWorkdir(item) {
-  return compact(item && item.workdir || "") || "无工作目录";
-}
-
-function resumeActivity(item) {
-  if (item && item.lastMessage) {
-    return compact(item.lastMessage);
-  }
-  if (item && item.lastEvent) {
-    return compact(item.lastEvent);
-  }
-  return "无消息记录";
-}
-
-function createNode(tag, className, text) {
-  var node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text != null) node.textContent = text;
-  return node;
-}
-
-function resumeBadges(item) {
-  var badges = [];
-  badges.push({ text: sessionKindLabel(item), className: "resume-item-badge is-" + sessionKindLabel(item) });
-  if (item && item.running) {
-    badges.push({ text: "running", className: "resume-item-badge is-running" });
-  }
-  return badges;
-}
-
-function renderResumeList(items, options) {
-  if (!resumeList) return;
-  var settings = options || {};
-  resumeList.innerHTML = "";
-  resumeList.hidden = false;
-  (items || []).forEach(function (item) {
-    var row = createNode("div", "resume-item");
-    var openButton = createNode("button", "resume-open");
-    openButton.type = "button";
-
-    var head = createNode("div", "resume-item-head");
-    var provider = createNode("div", "resume-item-provider");
-    var icon = createNode("span", "resume-provider-icon");
-    icon.innerHTML = providerIcon(item && item.provider, item && item.provider);
-    provider.appendChild(icon);
-
-    var titleWrap = createNode("div");
-    var title = createNode("div", "resume-item-title", shortSession(item && item.id));
-    titleWrap.appendChild(title);
-    if (item && item.provider) {
-      titleWrap.appendChild(createNode("div", "resume-item-desc", String(item.provider).toUpperCase()));
-    }
-    provider.appendChild(titleWrap);
-    head.appendChild(provider);
-
-    var badgeWrap = createNode("div");
-    resumeBadges(item).forEach(function (badge) {
-      badgeWrap.appendChild(createNode("span", badge.className, badge.text));
-    });
-    head.appendChild(badgeWrap);
-    openButton.appendChild(head);
-
-    openButton.appendChild(createNode("div", "resume-item-path", resumeWorkdir(item)));
-
-    var summary = createNode("div", "resume-item-summary");
-    var latest = createNode("div", "resume-summary-block");
-    latest.appendChild(createNode("div", "resume-summary-label", "Latest"));
-    latest.appendChild(createNode("div", "resume-summary-value", resumeActivity(item)));
-    summary.appendChild(latest);
-
-    var context = createNode("div", "resume-summary-block");
-    context.appendChild(createNode("div", "resume-summary-label", "Context"));
-    context.appendChild(createNode("div", "resume-summary-value", Number(item && item.messageCount || 0) + " 条消息"));
-    summary.appendChild(context);
-    openButton.appendChild(summary);
-
-    var meta = createNode("div", "resume-item-meta");
-    sessionMetaChips(item).forEach(function (chip) {
-      meta.appendChild(createNode("span", "resume-meta-chip", chip));
-    });
-    openButton.appendChild(meta);
-
-    openButton.addEventListener("click", async function () {
-      try {
-        openButton.disabled = true;
-        openButton.classList.add("is-loading");
-        if (typeof settings.onOpen === "function") {
-          await settings.onOpen(item, openButton);
-        }
-      } catch (err) {
-        openButton.disabled = false;
-        openButton.classList.remove("is-loading");
-        throw err;
-      }
-    });
-
-    var deleteButton = createNode("button", "resume-delete", "×");
-    deleteButton.type = "button";
-    deleteButton.setAttribute("aria-label", "删除会话");
-    deleteButton.addEventListener("click", async function (evt) {
-      evt.stopPropagation();
-      if (typeof settings.onDelete === "function") {
-        await settings.onDelete(item, row);
-      }
-    });
-
-    row.appendChild(openButton);
-    row.appendChild(deleteButton);
-    resumeList.appendChild(row);
-  });
-  if (!items || !items.length) {
-    resumeList.hidden = true;
-  }
+  await openSessionChooser();
 }

@@ -2,1560 +2,580 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"mime/multipart"
-	"os/exec"
+	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
-func (s *sessionStore) ensureSession(sessionID string) *Session {
-	return s.ensureSessionWithWorkdir(sessionID, "")
+type sessionRuntime struct {
+	session *Session
+	clients map[*clientConn]struct{}
 }
 
-func (s *sessionStore) ensureSessionWithWorkdir(sessionID, workdir string) *Session {
-	return s.ensureRuntime(sessionID, workdir, "").session
+type clientConn struct {
+	conn      *websocket.Conn
+	send      chan serverEvent
+	closeOnce sync.Once
+	writeMu   sync.Mutex
 }
 
-func (s *sessionStore) restoreSession(ctx context.Context, req restoreSessionRequest) (*Session, error) {
-	ref := normalizeRestoreRef(req.RestoreRef)
-	providerID := strings.TrimSpace(strings.ToLower(req.Provider))
-	if ref != nil {
-		providerID = ref.Provider
+type sessionStore struct {
+	mu           sync.RWMutex
+	sessions     map[string]*sessionRuntime
+	providers    map[string]Provider
+	appConfig    *appConfig
+	authPassword string
+	authToken    string
+}
+
+type restoreRef struct {
+	Provider          string `json:"provider"`
+	ProviderSessionID string `json:"providerSessionId,omitempty"`
+}
+
+type sessionListItem struct {
+	ID                string      `json:"id"`
+	Provider          string      `json:"provider"`
+	Model             string      `json:"model,omitempty"`
+	Title             string      `json:"title,omitempty"`
+	Workdir           string      `json:"workdir,omitempty"`
+	ProviderSessionID string      `json:"providerSessionId,omitempty"`
+	UpdatedAt         time.Time   `json:"updatedAt"`
+	MessageCount      int         `json:"messageCount"`
+	Running           bool        `json:"running"`
+	LastMessage       string      `json:"lastMessage,omitempty"`
+	LastEvent         string      `json:"lastEvent,omitempty"`
+	RestoreRef        *restoreRef `json:"restoreRef,omitempty"`
+}
+
+// newSessionStore 创建包含 Claude 和 Codex 的最小会话存储。
+func newSessionStore(password string) *sessionStore {
+	cfg := loadAppConfig()
+	store := &sessionStore{
+		sessions: map[string]*sessionRuntime{},
+		providers: map[string]Provider{
+			"claude": &ClaudeProvider{},
+			"codex":  &CodexProvider{},
+		},
+		appConfig:    cfg,
+		authPassword: strings.TrimSpace(password),
+		authToken:    authTokenForPassword(password),
 	}
-	if providerID == "" {
-		providerID = activeProvider.ID()
+	if err := store.loadPersistedSessions(); err != nil {
+		// 持久化文件损坏时不阻断启动，后续仍可继续使用新会话。
 	}
-	if _, ok := availableProviders[providerID]; !ok {
-		return nil, errors.New("provider is not available")
+	return store
+}
+
+// newUUID 生成标准 UUID，用于会话、消息、事件和上传文件标识。
+func newUUID() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return time.Now().Format("20060102150405.000000000")
+	}
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		buf[0:4],
+		buf[4:6],
+		buf[6:8],
+		buf[8:10],
+		buf[10:16],
+	)
+}
+
+func (s *sessionStore) handleIndex(staticFS fs.FS) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+			withCache(http.FileServer(http.FS(staticFS))).ServeHTTP(w, r)
+			return
+		}
+		content, err := fs.ReadFile(staticFS, "index.html")
+		if err != nil {
+			http.Error(w, "index file not found", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(content)
+	}
+}
+
+// handleAppConfig 向前端暴露当前最小应用配置。
+func (s *sessionStore) handleAppConfig(w http.ResponseWriter, _ *http.Request) {
+	defaultProvider := s.defaultProviderID()
+	defaultModel := s.defaultModelForProvider(defaultProvider)
+	providers := make([]map[string]any, 0, len(s.appConfig.Providers))
+	for _, item := range s.appConfig.Providers {
+		if item == nil {
+			continue
+		}
+		providers = append(providers, map[string]any{
+			"id":           item.ID,
+			"name":         item.Name,
+			"displayName":  item.Name,
+			"available":    item.Available,
+			"isDefault":    item.IsDefault,
+			"defaultModel": item.DefaultModel,
+			"models":       append([]string(nil), item.Models...),
+		})
+	}
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	_, _ = w.Write([]byte("window.__APP_CONFIG = " + mustJSON(map[string]any{
+		"provider":  defaultProvider,
+		"model":     defaultModel,
+		"version":   appVersion(),
+		"appName":   s.appConfig.AppName,
+		"providers": providers,
+	}) + ";\n"))
+}
+
+// handleLogin 校验登录密码并设置会话 cookie。
+func (s *sessionStore) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if strings.TrimSpace(req.Password) != s.authPassword {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "code_web_auth",
+		Value:    s.authToken,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleAuth 返回当前请求是否已经登录。
+func (s *sessionStore) handleAuth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": s.isAuthenticated(r)})
+}
+
+// handleLogout 清理登录 cookie。
+func (s *sessionStore) handleLogout(w http.ResponseWriter, _ *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "code_web_auth",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleStatus 返回当前服务的基础状态信息。
+func (s *sessionStore) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	defaultProvider := s.defaultProviderID()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider": defaultProvider,
+		"model":    s.defaultModelForProvider(defaultProvider),
+	})
+}
+
+// handleSessions 返回当前本地会话列表。
+func (s *sessionStore) handleSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	items, err := s.listSessions(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// handleRestoreSession 根据本地持久化会话恢复会话内容。
+func (s *sessionStore) handleRestoreSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
 
-	workdir := normalizeWorkdir(strings.TrimSpace(req.Workdir))
-	if ref != nil && strings.TrimSpace(ref.Workdir) != "" {
-		workdir = normalizeWorkdir(ref.Workdir)
+	var req struct {
+		Provider   string      `json:"provider"`
+		SessionID  string      `json:"sessionId"`
+		RestoreRef *restoreRef `json:"restoreRef"`
 	}
-	if workdir == "" || workdir == "." {
-		workdir = defaultWorkdir
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	providerID := strings.TrimSpace(req.Provider)
+	remoteID := strings.TrimSpace(req.SessionID)
+	if req.RestoreRef != nil {
+		if providerID == "" {
+			providerID = strings.TrimSpace(req.RestoreRef.Provider)
+		}
+		if remoteID == "" {
+			remoteID = strings.TrimSpace(req.RestoreRef.ProviderSessionID)
+		}
+	}
+	if remoteID == "" {
+		http.Error(w, "missing local session id", http.StatusBadRequest)
+		return
+	}
+	if !isLocalSessionID(remoteID) {
+		http.Error(w, "only local sessions can be restored", http.StatusBadRequest)
+		return
 	}
 
-	rt := s.ensureRuntime("", workdir, providerID)
-	sessionID := rt.session.ID
+	s.mu.RLock()
+	if rt, ok := s.sessions[remoteID]; ok && rt != nil && rt.session != nil {
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{"sessionId": rt.session.ID})
+		return
+	}
+	s.mu.RUnlock()
+
+	session, err := s.readPersistedSession(providerID, remoteID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if session == nil {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
 
 	s.mu.Lock()
-	rt.session.Provider = providerID
-	if model := firstNonEmpty(
-		func() string {
-			if ref == nil {
-				return ""
-			}
-			return strings.TrimSpace(ref.Model)
-		}(),
-		strings.TrimSpace(req.Model),
-	); model != "" {
-		rt.session.Model = model
+	s.sessions[session.ID] = &sessionRuntime{
+		session: session,
+		clients: map[*clientConn]struct{}{},
 	}
-	rt.session.Workdir = workdir
-	rt.session.CodexThreadID = firstNonEmpty(
-		func() string {
-			if ref == nil {
-				return ""
-			}
-			return strings.TrimSpace(ref.CodexThreadID)
-		}(),
-		strings.TrimSpace(req.CodexThreadID),
-	)
-	rt.session.ProviderSessionID = firstNonEmpty(
-		func() string {
-			if ref == nil {
-				return ""
-			}
-			return strings.TrimSpace(ref.ProviderSessionID)
-		}(),
-		strings.TrimSpace(req.ProviderSessionID),
-	)
-	rt.session.Messages = make([]Message, 0, 32)
-	rt.session.Events = make([]EventLog, 0, 64)
-	rt.session.DraftMessage = nil
-	rt.session.ActiveTaskID = ""
-	rt.session.ActiveTurnID = ""
-	rt.stopRequested = false
-	rt.cancelTask = nil
-	rt.session.UpdatedAt = time.Now()
 	s.mu.Unlock()
 
-	switch providerID {
-	case providerCodex:
-		if strings.TrimSpace(rt.session.CodexThreadID) == "" {
-			return nil, errors.New("missing codex thread id")
-		}
-		if s.app == nil {
-			return nil, errors.New("codex app-server is not available")
-		}
-		if err := s.hydrateCodexSession(ctx, sessionID, strings.TrimSpace(rt.session.CodexThreadID)); err != nil {
-			return nil, err
-		}
-	case providerClaude:
-		if strings.TrimSpace(rt.session.ProviderSessionID) == "" {
-			return nil, errors.New("missing claude session id")
-		}
-		if len(req.Messages) > 0 || len(req.Events) > 0 || req.DraftMessage != nil {
-			s.replaceTimeline(sessionID, req.Messages, req.Events)
-			s.mu.Lock()
-			if existing, ok := s.sessions[sessionID]; ok {
-				existing.session.DraftMessage = cloneMessagePtr(req.DraftMessage)
-				existing.session.UpdatedAt = time.Now()
-			}
-			s.mu.Unlock()
-		} else {
-			s.appendMessage(sessionID, "system", "已恢复 Claude 远端会话，后续消息会继续复用该会话上下文。")
-		}
-	}
-
-	return s.cloneSession(sessionID), nil
+	writeJSON(w, http.StatusOK, map[string]any{"sessionId": session.ID})
 }
 
-func (s *sessionStore) ensureRuntime(sessionID, workdir, providerID string) *sessionRuntime {
+// handleDeleteSession 删除本地会话。
+func (s *sessionStore) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID         string      `json:"id"`
+		Provider   string      `json:"provider"`
+		RestoreRef *restoreRef `json:"restoreRef"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	sessionID := strings.TrimSpace(req.ID)
+	providerID := strings.TrimSpace(req.Provider)
+	if req.RestoreRef != nil {
+		if sessionID == "" {
+			sessionID = strings.TrimSpace(req.RestoreRef.ProviderSessionID)
+		}
+		if providerID == "" {
+			providerID = strings.TrimSpace(req.RestoreRef.Provider)
+		}
+	}
+	if sessionID == "" {
+		http.Error(w, "missing session id", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	rt, ok := s.sessions[sessionID]
+	if !ok {
+		s.mu.Unlock()
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	if rt.session.IsRunning {
+		s.mu.Unlock()
+		http.Error(w, "当前会话仍在生成中，请稍候", http.StatusBadRequest)
+		return
+	}
+	delete(s.sessions, sessionID)
+	s.mu.Unlock()
+	for client := range rt.clients {
+		closeClientConn(client)
+	}
+	if err := s.deletePersistedSession(firstNonEmptyString(providerID, rt.session.Provider), sessionID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = s.persistSessions()
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleNewSession 创建一个新的聊天会话。
+func (s *sessionStore) handleNewSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Workdir  string `json:"workdir"`
+		Provider string `json:"provider"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	provider := s.providerByName(req.Provider)
+	if provider == nil {
+		http.Error(w, "unsupported provider", http.StatusBadRequest)
+		return
+	}
+
+	session := &Session{
+		ID:                newUUID(),
+		ProviderSessionID: "",
+		Provider:          provider.Name(),
+		Model:             s.defaultModelForProvider(provider.Name()),
+		Workdir:           normalizeWorkdir(req.Workdir),
+		Messages:          []*Message{},
+		Events:            []*Event{},
+		IsRunning:         false,
+		UpdatedAt:         time.Now(),
+	}
+
+	s.mu.Lock()
+	s.sessions[session.ID] = &sessionRuntime{
+		session: session,
+		clients: map[*clientConn]struct{}{},
+	}
+	s.mu.Unlock()
+	_ = s.persistSessions()
+
+	writeJSON(w, http.StatusOK, map[string]string{"sessionId": session.ID})
+}
+
+// handleSend 接收前端发送的消息并触发异步生成。
+func (s *sessionStore) handleSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(20 << 20); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+
+	sessionID := strings.TrimSpace(r.FormValue("sessionId"))
+	content := strings.TrimSpace(r.FormValue("content"))
+	model := strings.TrimSpace(r.FormValue("model"))
+	if sessionID == "" {
+		http.Error(w, "missing sessionId", http.StatusBadRequest)
+		return
+	}
+	imageIDs, err := s.saveMultipartImages(r.MultipartForm.File["images"])
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if content == "" && len(imageIDs) == 0 {
+		http.Error(w, "message is empty", http.StatusBadRequest)
+		return
+	}
+	if err := s.enqueuePrompt(sessionID, content, model, imageIDs); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleWS 建立 WebSocket 连接，并向前端同步会话快照和增量消息。
+func (s *sessionStore) handleWS(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	var hello clientEvent
+	if err := conn.ReadJSON(&hello); err != nil {
+		return
+	}
+	if hello.Type != "hello" {
+		_ = conn.WriteJSON(serverEvent{Type: "error", Error: "first message must be hello"})
+		return
+	}
+
+	rt, client, err := s.attachClient(hello.SessionID, conn)
+	if err != nil {
+		_ = conn.WriteJSON(serverEvent{Type: "error", Error: err.Error()})
+		return
+	}
+	defer s.detachClient(rt.session.ID, client)
+
+	_ = writeClientJSON(client, serverEvent{
+		Type:    "snapshot",
+		Session: cloneSession(rt.session),
+		Running: rt.session.IsRunning,
+	})
+
+	for {
+		var event clientEvent
+		if err := conn.ReadJSON(&event); err != nil {
+			return
+		}
+		if event.Type == "ping" {
+			_ = writeClientJSON(client, serverEvent{Type: "pong"})
+		}
+	}
+}
+
+// attachClient 把一个 WebSocket 客户端挂到指定会话上。
+func (s *sessionStore) attachClient(sessionID string, conn *websocket.Conn) (*sessionRuntime, *clientConn, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if sessionID != "" {
-		if rt, ok := s.sessions[sessionID]; ok {
-			if rt.session.Workdir == "" {
-				rt.session.Workdir = normalizeWorkdir(workdir)
-			}
-			return rt
-		}
+	rt, ok := s.sessions[sessionID]
+	if !ok {
+		return nil, nil, errors.New("session not found")
+	}
+
+	client := &clientConn{conn: conn, send: make(chan serverEvent, 64)}
+	rt.clients[client] = struct{}{}
+	go startClientWriter(client)
+	return rt, client, nil
+}
+
+// detachClient 把客户端从会话中移除并关闭连接。
+func (s *sessionStore) detachClient(sessionID string, target *clientConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rt, ok := s.sessions[sessionID]
+	if !ok {
+		return
+	}
+	delete(rt.clients, target)
+	closeClientConn(target)
+}
+
+// enqueuePrompt 把用户消息写入会话，并启动新的生成流程。
+func (s *sessionStore) enqueuePrompt(sessionID, content, model string, imageIDs []string) error {
+	s.mu.Lock()
+	rt, ok := s.sessions[sessionID]
+	if !ok {
+		s.mu.Unlock()
+		return errors.New("session not found")
+	}
+	if rt.session.IsRunning {
+		s.mu.Unlock()
+		return errors.New("当前会话仍在生成中，请稍候")
+	}
+	imageURLs, imagePaths, err := resolveImageFiles(imageIDs)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if strings.TrimSpace(model) != "" {
+		rt.session.Model = strings.TrimSpace(model)
 	}
 
 	now := time.Now()
-	providerID = strings.TrimSpace(strings.ToLower(providerID))
-	if providerID == "" {
-		providerID = activeProvider.ID()
-	}
-	session := &Session{
-		ID:        uuid.NewString(),
-		Provider:  providerID,
-		Model:     defaultModelForProviderID(providerID),
-		Workdir:   normalizeWorkdir(workdir),
-		Messages:  make([]Message, 0, 16),
-		Events:    make([]EventLog, 0, 32),
-		UpdatedAt: now,
-	}
-	rt := &sessionRuntime{
-		session: session,
-		clients: make(map[*clientConn]struct{}),
-	}
-	s.sessions[session.ID] = rt
-	return rt
-}
-
-func (s *sessionStore) currentModel() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return strings.TrimSpace(s.meta.Model)
-}
-
-func (s *sessionStore) sessionProvider(sessionID string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return activeProvider.ID()
-	}
-	return firstNonEmpty(strings.TrimSpace(rt.session.Provider), providerCodex)
-}
-
-func (s *sessionStore) sessionModel(sessionID string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return defaultModelForProviderID(activeProvider.ID())
-	}
-	providerID := firstNonEmpty(strings.TrimSpace(rt.session.Provider), providerCodex)
-	model := strings.TrimSpace(rt.session.Model)
-	if model != "" {
-		return model
-	}
-	return defaultModelForProviderID(providerID)
-}
-
-func (s *sessionStore) currentApprovalPolicy() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return strings.TrimSpace(s.meta.ApprovalPolicy)
-}
-
-func (s *sessionStore) currentServiceTier() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return strings.TrimSpace(s.meta.ServiceTier)
-}
-
-func (s *sessionStore) currentFastMode() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.meta.FastMode
-}
-
-func (s *sessionStore) setModel(sessionID, value string) (string, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return s.sessionModel(sessionID), nil
-	}
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.Unlock()
-		return "", errors.New("session not found")
-	}
-	rt.session.Model = value
-	rt.session.UpdatedAt = time.Now()
-	s.mu.Unlock()
-	providerForID(s.sessionProvider(sessionID)).InvalidateSession(s, sessionID)
-	s.broadcastMeta(sessionID)
-	return value, nil
-}
-
-func (s *sessionStore) setApprovalPolicy(value string) (string, error) {
-	value = strings.TrimSpace(strings.ToLower(value))
-	if value == "" {
-		return s.currentApprovalPolicy(), nil
-	}
-	if value != "never" {
-		return "", errors.New("web mode currently only supports approvals=never")
-	}
-	s.mu.Lock()
-	s.meta.ApprovalPolicy = value
-	s.mu.Unlock()
-	s.broadcastMetaToProviders(providerCodex)
-	s.broadcastMetaToProviders(providerClaude)
-	return value, nil
-}
-
-func (s *sessionStore) setFastMode(sessionID, value string) (bool, string, error) {
-	return providerForID(s.sessionProvider(sessionID)).SetFastMode(s, sessionID, value)
-}
-
-func (s *sessionStore) writeServiceTier(value string) error {
-	if s.app == nil {
-		return errors.New("codex app-server is not available")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	return s.app.WriteConfigValue(ctx, "service_tier", value)
-}
-
-func (s *sessionStore) clearServiceTier() error {
-	if s.app == nil {
-		return errors.New("codex app-server is not available")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	return s.app.ClearConfigValue(ctx, "service_tier")
-}
-
-func (s *sessionStore) resetSessionThreads() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, rt := range s.sessions {
-		if rt.session.Provider != providerCodex {
-			continue
-		}
-		if rt.session.CodexThreadID == "" && rt.session.ProviderSessionID == "" && rt.session.ActiveTurnID == "" {
-			continue
-		}
-		rt.session.CodexThreadID = ""
-		rt.session.ProviderSessionID = ""
-		rt.session.ActiveTurnID = ""
-		rt.session.UpdatedAt = time.Now()
-	}
-}
-
-func (s *sessionStore) stopActiveTask(sessionID string) (bool, error) {
-	session := s.cloneSession(sessionID)
-	if session == nil {
-		return false, errors.New("session not found")
-	}
-	if strings.TrimSpace(session.ActiveTaskID) == "" {
-		return false, nil
-	}
-	return providerForID(session.Provider).StopActiveTask(s, sessionID)
-}
-
-func (s *sessionStore) compactSession(sessionID string) (bool, error) {
-	return providerForID(s.sessionProvider(sessionID)).CompactSession(s, sessionID)
-}
-
-func (s *sessionStore) sessionWorkdir(sessionID string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return defaultWorkdir
-	}
-	return normalizeWorkdir(rt.session.Workdir)
-}
-
-func (s *sessionStore) metaForSession(sessionID string) appMeta {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return s.meta
-	}
-	meta := s.meta
-	meta.Provider = firstNonEmpty(strings.TrimSpace(rt.session.Provider), providerCodex)
-	meta.Model = firstNonEmpty(strings.TrimSpace(rt.session.Model), defaultModelForProviderID(meta.Provider))
-	meta.Cwd = normalizeWorkdir(rt.session.Workdir)
-	if !supportsFastModeFor(meta.Provider) {
-		meta.ServiceTier = ""
-		meta.FastMode = false
-	}
-	return meta
-}
-
-func (s *sessionStore) broadcastMeta(sessionID string) {
-	s.mu.RLock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.RUnlock()
-		return
-	}
-	clients := cloneClients(rt.clients)
-	s.mu.RUnlock()
-	meta := s.metaForSession(sessionID)
-	broadcastJSON(clients, serverEvent{Type: "meta_update", Meta: &meta})
-}
-
-func (s *sessionStore) broadcastMetaToProviders(providerID string) {
-	s.mu.RLock()
-	sessionIDs := make([]string, 0, len(s.sessions))
-	for sessionID, rt := range s.sessions {
-		if firstNonEmpty(strings.TrimSpace(rt.session.Provider), providerCodex) == providerID {
-			sessionIDs = append(sessionIDs, sessionID)
-		}
-	}
-	s.mu.RUnlock()
-	for _, sessionID := range sessionIDs {
-		s.broadcastMeta(sessionID)
-	}
-}
-
-func (s *sessionStore) enqueuePrompt(sessionID, content string, imageIDs []string) error {
-	if content == "" && len(imageIDs) == 0 {
-		return errors.New("message is empty")
-	}
-	if s.sessionProvider(sessionID) == providerCodex && s.app == nil {
-		return errors.New("codex app-server is not available")
-	}
-
-	imageURLs, imagePaths, err := resolveImageFiles(imageIDs)
-	if err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.Unlock()
-		return errors.New("session not found")
-	}
-	if rt.session.ActiveTaskID != "" {
-		s.mu.Unlock()
-		return errors.New("a task is already running in this session")
-	}
-
-	userMsg := Message{
-		ID:        uuid.NewString(),
-		Role:      "user",
-		Content:   content,
-		ImageURLs: imageURLs,
-		CreatedAt: time.Now(),
-	}
-	rt.session.Messages = append(rt.session.Messages, userMsg)
-	rt.session.UpdatedAt = time.Now()
-	taskID := uuid.NewString()
-	rt.session.ActiveTaskID = taskID
-	clients := cloneClients(rt.clients)
+	userMessage := &Message{ID: newUUID(), Role: "user", Content: content, ImageURLs: append([]string(nil), imageURLs...), CreatedAt: now}
+	rt.session.Messages = append(rt.session.Messages, userMessage)
+	rt.session.IsRunning = true
+	rt.session.UpdatedAt = now
+	sessionID = rt.session.ID
+	model = rt.session.Model
 	s.mu.Unlock()
 
-	broadcastJSON(clients, serverEvent{Type: "message", Message: &userMsg})
-	broadcastJSON(clients, serverEvent{Type: "task_status", TaskID: taskID, Running: true})
-
-	providerForID(rt.session.Provider).RunPrompt(s, sessionID, taskID, content, imagePaths)
+	s.broadcast(sessionID, serverEvent{Type: "message", Message: userMessage})
+	s.broadcast(sessionID, serverEvent{Type: "task_status", Running: true})
+	_ = s.persistSessions()
+	go s.runPrompt(sessionID, content, model, imagePaths)
 	return nil
 }
 
-func (s *sessionStore) enqueueReview(sessionID, args string) error {
-	var taskID string
-	var clients map[*clientConn]struct{}
-	commandText := "/review"
-	if args != "" {
-		commandText += " " + args
-	}
-
+// runPrompt 调用当前会话对应的 CLI，并把结果回写到会话和前端。
+func (s *sessionStore) runPrompt(sessionID, content, model string, imagePaths []string) {
 	s.mu.Lock()
 	rt, ok := s.sessions[sessionID]
 	if !ok {
 		s.mu.Unlock()
-		return errors.New("session not found")
-	}
-	if rt.session.ActiveTaskID != "" {
-		s.mu.Unlock()
-		return errors.New("a task is already running in this session")
+		return
 	}
 
-	userMsg := Message{
-		ID:        uuid.NewString(),
-		Role:      "user",
-		Content:   commandText,
-		CreatedAt: time.Now(),
+	draft := &Message{ID: newUUID(), Role: "assistant", Content: "", CreatedAt: time.Now()}
+	rt.session.DraftMessage = draft
+	sessionSnapshot := cloneSession(rt.session)
+	if strings.TrimSpace(model) != "" {
+		sessionSnapshot.Model = strings.TrimSpace(model)
 	}
-	rt.session.Messages = append(rt.session.Messages, userMsg)
-	rt.session.UpdatedAt = time.Now()
-	taskID = uuid.NewString()
-	rt.session.ActiveTaskID = taskID
-	clients = cloneClients(rt.clients)
 	s.mu.Unlock()
 
-	broadcastJSON(clients, serverEvent{Type: "message", Message: &userMsg})
-	broadcastJSON(clients, serverEvent{Type: "task_status", TaskID: taskID, Running: true})
-	providerForID(s.sessionProvider(sessionID)).RunReview(s, sessionID, taskID, args)
-	return nil
-}
+	s.broadcast(sessionID, serverEvent{Type: "message_delta", Message: cloneMessage(draft)})
 
-func (s *sessionStore) runAppServerTask(sessionID, taskID, prompt string, imagePaths []string) {
-	waited := s.acquireTaskSlot(sessionID)
-	defer s.releaseTaskSlot()
-
-	if waited {
-		s.appendEvent(sessionID, "status", "task dequeued", "")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), appServerRPCTimeout)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	threadID, err := s.app.StartTurn(ctx, sessionID, taskID, s.sessionWorkdir(sessionID), prompt, imagePaths)
-	if err != nil {
-		s.finishTaskWithError(sessionID, taskID, err)
-		return
+	var execMu sync.Mutex
+	var finishOnce sync.Once
+	finishSession := func() {
+		finishOnce.Do(func() {
+			s.markSessionIdle(sessionID)
+			s.broadcast(sessionID, serverEvent{Type: "task_status", Running: false})
+		})
 	}
-
-	s.monitorAppServerTurn(sessionID, taskID, threadID, prompt, time.Now())
-}
-
-func (s *sessionStore) runReviewTask(sessionID, taskID, args string) {
-	waited := s.acquireTaskSlot(sessionID)
-	defer s.releaseTaskSlot()
-
-	if waited {
-		s.appendEvent(sessionID, "status", "task dequeued", "")
-	}
-
-	s.appendEvent(sessionID, "status", "review started", "")
-	if s.sessionProvider(sessionID) != providerCodex {
-		s.finishTaskWithError(sessionID, taskID, errors.New("review is only available with codex review"))
-		return
-	}
-	cmdArgs := []string{"review", "--uncommitted"}
-	if model := s.sessionModel(sessionID); model != "" {
-		cmdArgs = append(cmdArgs, "-m", model)
-	}
-	if args != "" {
-		cmdArgs = append(cmdArgs, args)
-	}
-
-	cmd := exec.CommandContext(context.Background(), "codex", cmdArgs...)
-	cmd.Dir = s.sessionWorkdir(sessionID)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(output))
-		if msg == "" {
-			msg = err.Error()
-		}
-		s.finishTaskWithError(sessionID, taskID, fmt.Errorf("review failed: %s", msg))
-		return
-	}
-
-	result := strings.TrimSpace(string(output))
-	if result == "" {
-		result = "No review output."
-	}
-	s.appendMessage(sessionID, "assistant", result)
-	s.finishTaskOK(sessionID, taskID)
-}
-
-func (s *sessionStore) acquireTaskSlot(sessionID string) bool {
-	select {
-	case s.taskSlots <- struct{}{}:
-		return false
-	default:
-		s.appendEvent(sessionID, "status", "task queued", fmt.Sprintf("waiting for an available slot (%d max)", s.maxConcurrent))
-		s.taskSlots <- struct{}{}
-		return true
-	}
-}
-
-func (s *sessionStore) releaseTaskSlot() {
-	select {
-	case <-s.taskSlots:
-	default:
-	}
-}
-
-func (s *sessionStore) monitorAppServerTurn(sessionID, taskID, threadID, prompt string, startedAt time.Time) {
-	threadID = strings.TrimSpace(threadID)
-	if threadID == "" {
-		return
-	}
-
-	timer := time.NewTimer(appServerTurnTimeout)
-	defer timer.Stop()
-
-	attempt := 1
-	for {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(appServerTurnTimeout)
-
-		select {
-		case <-timer.C:
-		}
-
-		if !s.isTaskActive(sessionID, taskID) {
+	err := s.providerBySession(sessionSnapshot).Exec(ctx, sessionSnapshot, content, imagePaths, func(state *ProviderStateUpdate) {
+		if state == nil {
 			return
 		}
-
-		s.app.markSuspect(fmt.Sprintf("turn timeout after %s", appServerTurnTimeout))
-		s.appendEvent(sessionID, "status", "任务长时间无响应，正在检查远端线程", fmt.Sprintf("本次 turn 已超过 %s 未收到完成信号，正在通过独立 CLI 读取远端线程历史确认结果（第 %d 次）", appServerTurnTimeout, attempt))
-
-		checkCtx, cancel := context.WithTimeout(context.Background(), appServerThreadReadTTL)
-		thread, err := s.app.ReadThreadViaIsolatedCLI(checkCtx, threadID)
-		cancel()
-		if err != nil {
-			s.appendEvent(sessionID, "status", "读取远端线程历史失败", err.Error())
-			attempt++
-			continue
+		execMu.Lock()
+		defer execMu.Unlock()
+		s.updateProviderState(sessionID, state)
+		if state.IsComplete {
+			finishSession()
 		}
-
-		outcome := detectRecoveredTurnOutcome(thread, s.cloneSession(sessionID), prompt, startedAt)
-		if !outcome.Done {
-			attempt++
-			continue
+	}, func(delta string) {
+		if delta == "" {
+			return
 		}
-
-		s.applyRecoveredCodexThread(sessionID, thread)
-		s.appendEvent(sessionID, "status", "已从远端线程历史恢复任务结果", outcome.Summary)
-		s.finishRecoveredTask(sessionID, taskID, outcome.Err)
-		return
-	}
-}
-
-func (s *sessionStore) setTaskCancel(sessionID string, cancel context.CancelFunc) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if rt, ok := s.sessions[sessionID]; ok {
-		rt.cancelTask = cancel
-	}
-}
-
-func (s *sessionStore) clearTaskCancel(sessionID string, cancel context.CancelFunc) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if rt, ok := s.sessions[sessionID]; ok && rt.cancelTask != nil {
-		rt.cancelTask = nil
-	}
-}
-
-func (s *sessionStore) cancelTask(sessionID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rt, ok := s.sessions[sessionID]
-	if !ok || rt.cancelTask == nil {
-		return false
-	}
-	rt.cancelTask()
-	return true
-}
-
-func (s *sessionStore) updateProviderSessionID(sessionID, providerSessionID string) {
-	providerSessionID = strings.TrimSpace(providerSessionID)
-	if providerSessionID == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return
-	}
-	if rt.session.ProviderSessionID == providerSessionID {
-		return
-	}
-	rt.session.ProviderSessionID = providerSessionID
-	rt.session.UpdatedAt = time.Now()
-}
-
-func (s *sessionStore) appendAssistantDelta(sessionID, itemID, delta string) {
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-
-	draft := rt.session.DraftMessage
-	if draft == nil || draft.ID != itemID {
-		draft = &Message{
-			ID:        firstNonEmpty(itemID, uuid.NewString()),
-			Role:      "assistant",
-			CreatedAt: time.Now(),
+		execMu.Lock()
+		defer execMu.Unlock()
+		s.appendAssistantDelta(sessionID, draft.ID, delta)
+	}, func(text string) {
+		if strings.TrimSpace(text) == "" {
+			return
 		}
-	}
-	draft.Content += delta
-	rt.session.DraftMessage = draft
-	rt.session.UpdatedAt = time.Now()
-	clients := cloneClients(rt.clients)
-	copyDraft := *draft
-	s.mu.Unlock()
-
-	broadcastJSON(clients, serverEvent{Type: "message_delta", Message: &copyDraft})
-}
-
-func (s *sessionStore) completeAssistantMessage(sessionID, itemID, text string) {
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-
-	var msg Message
-	if rt.session.DraftMessage != nil && (itemID == "" || rt.session.DraftMessage.ID == itemID) {
-		msg = *rt.session.DraftMessage
-	} else {
-		msg = Message{
-			ID:        firstNonEmpty(itemID, uuid.NewString()),
-			Role:      "assistant",
-			CreatedAt: time.Now(),
+		execMu.Lock()
+		defer execMu.Unlock()
+		s.completeAssistantMessage(sessionID, draft.ID, text)
+		finishSession()
+	}, func(event *Event) {
+		if event == nil {
+			return
 		}
-	}
-	if strings.TrimSpace(text) != "" {
-		msg.Content = text
-	}
-	if strings.TrimSpace(msg.Content) == "" {
-		rt.session.DraftMessage = nil
-		rt.session.UpdatedAt = time.Now()
-		s.mu.Unlock()
-		return
-	}
-
-	updated := false
-	if strings.TrimSpace(msg.ID) != "" {
-		for i := len(rt.session.Messages) - 1; i >= 0; i-- {
-			existing := &rt.session.Messages[i]
-			if existing.Role != "assistant" || strings.TrimSpace(existing.ID) != strings.TrimSpace(msg.ID) {
-				continue
-			}
-			existing.Content = msg.Content
-			updated = true
-			msg = *existing
-			break
-		}
-	}
-	if !updated {
-		rt.session.Messages = append(rt.session.Messages, msg)
-	}
-	rt.session.DraftMessage = nil
-	rt.session.UpdatedAt = time.Now()
-	clients := cloneClients(rt.clients)
-	s.mu.Unlock()
-
-	broadcastJSON(clients, serverEvent{Type: "message_final", Message: &msg})
-}
-
-func (s *sessionStore) flushDraftMessage(sessionID string) {
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok || rt.session.DraftMessage == nil || strings.TrimSpace(rt.session.DraftMessage.Content) == "" {
-		s.mu.Unlock()
-		return
-	}
-
-	msg := *rt.session.DraftMessage
-	rt.session.Messages = append(rt.session.Messages, msg)
-	rt.session.DraftMessage = nil
-	rt.session.UpdatedAt = time.Now()
-	clients := cloneClients(rt.clients)
-	s.mu.Unlock()
-
-	broadcastJSON(clients, serverEvent{Type: "message_final", Message: &msg})
-}
-
-func (s *sessionStore) finishTaskOK(sessionID, taskID string) {
-	s.flushDraftMessage(sessionID)
-
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if ok && rt.session.ActiveTaskID == taskID {
-		rt.session.ActiveTaskID = ""
-		rt.session.ActiveTurnID = ""
-		rt.stopRequested = false
-		rt.cancelTask = nil
-		rt.session.UpdatedAt = time.Now()
-	}
-	clients := map[*clientConn]struct{}{}
-	if ok {
-		clients = cloneClients(rt.clients)
-	}
-	s.mu.Unlock()
-
-	broadcastJSON(clients, serverEvent{Type: "task_status", TaskID: taskID, Running: false})
-}
-
-func (s *sessionStore) finishActiveTaskOK(sessionID string) {
-	taskID := s.activeTaskID(sessionID)
-	if taskID == "" {
-		return
-	}
-	s.finishTaskOK(sessionID, taskID)
-}
-
-func (s *sessionStore) finishTaskWithError(sessionID, taskID string, err error) {
-	s.flushDraftMessage(sessionID)
-	s.appendMessage(sessionID, "system", "任务执行失败："+err.Error())
-
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if ok && rt.session.ActiveTaskID == taskID {
-		rt.session.ActiveTaskID = ""
-		rt.session.ActiveTurnID = ""
-		rt.stopRequested = false
-		rt.cancelTask = nil
-		rt.session.UpdatedAt = time.Now()
-	}
-	clients := map[*clientConn]struct{}{}
-	if ok {
-		clients = cloneClients(rt.clients)
-	}
-	s.mu.Unlock()
-
-	broadcastJSON(clients, serverEvent{Type: "error", Error: err.Error()})
-	broadcastJSON(clients, serverEvent{Type: "task_status", TaskID: taskID, Running: false})
-}
-
-func (s *sessionStore) finishRecoveredTask(sessionID, taskID string, err error) {
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if ok {
-		rt.stopRequested = false
-		rt.cancelTask = nil
-		rt.session.ActiveTaskID = ""
-		rt.session.ActiveTurnID = ""
-		rt.session.UpdatedAt = time.Now()
-	}
-	clients := map[*clientConn]struct{}{}
-	if ok {
-		clients = cloneClients(rt.clients)
-	}
-	s.mu.Unlock()
-
-	if err != nil {
-		broadcastJSON(clients, serverEvent{Type: "error", Error: err.Error()})
-	}
-	broadcastJSON(clients, serverEvent{Type: "task_status", TaskID: taskID, Running: false})
-}
-
-func (s *sessionStore) finishActiveTaskWithError(sessionID string, err error) {
-	taskID := s.activeTaskID(sessionID)
-	if taskID == "" {
-		return
-	}
-	s.finishTaskWithError(sessionID, taskID, err)
-}
-
-func (s *sessionStore) failAllActiveTasks(message string) {
-	s.mu.RLock()
-	sessionIDs := make([]string, 0, len(s.sessions))
-	for sessionID, rt := range s.sessions {
-		if rt.session.ActiveTaskID != "" {
-			sessionIDs = append(sessionIDs, sessionID)
-		}
-	}
-	s.mu.RUnlock()
-
-	for _, sessionID := range sessionIDs {
-		s.finishActiveTaskWithError(sessionID, errors.New(message))
-	}
-}
-
-func (s *sessionStore) activeTaskID(sessionID string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return ""
-	}
-	return rt.session.ActiveTaskID
-}
-
-func (s *sessionStore) isTaskActive(sessionID, taskID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return false
-	}
-	return strings.TrimSpace(rt.session.ActiveTaskID) == strings.TrimSpace(taskID)
-}
-
-func (s *sessionStore) reconcileSessionTask(sessionID string) bool {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return false
-	}
-
-	var taskID string
-	var clients map[*clientConn]struct{}
-	var providerID string
-
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok || strings.TrimSpace(rt.session.ActiveTaskID) == "" {
-		s.mu.Unlock()
-		return false
-	}
-	if strings.TrimSpace(rt.session.ActiveTurnID) != "" {
-		s.mu.Unlock()
-		return false
-	}
-	if time.Since(rt.session.UpdatedAt) < staleTaskIdle {
-		s.mu.Unlock()
-		return false
-	}
-	providerID = firstNonEmpty(strings.TrimSpace(rt.session.Provider), providerCodex)
-	if providerID == providerCodex && s.app != nil && s.app.hasKnownActiveTurn(rt.session) {
-		s.mu.Unlock()
-		return false
-	}
-
-	taskID = rt.session.ActiveTaskID
-	rt.session.ActiveTaskID = ""
-	rt.stopRequested = false
-	rt.cancelTask = nil
-	rt.session.UpdatedAt = time.Now()
-	clients = cloneClients(rt.clients)
-	s.mu.Unlock()
-
-	s.appendMessage(sessionID, "system", "检测到卡住的任务状态，已自动恢复为空闲。")
-	broadcastJSON(clients, serverEvent{Type: "task_status", TaskID: taskID, Running: false})
-	return true
-}
-
-func (s *sessionStore) appendMessage(sessionID, role, content string) {
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-
-	msg := Message{
-		ID:        uuid.NewString(),
-		Role:      role,
-		Content:   content,
-		CreatedAt: time.Now(),
-	}
-	rt.session.Messages = append(rt.session.Messages, msg)
-	rt.session.UpdatedAt = time.Now()
-	clients := cloneClients(rt.clients)
-	s.mu.Unlock()
-
-	broadcastJSON(clients, serverEvent{Type: "message", Message: &msg})
-}
-
-func (s *sessionStore) replaceTimeline(sessionID string, messages []Message, events []EventLog) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return
-	}
-	rt.session.Messages = append([]Message(nil), messages...)
-	rt.session.Events = append([]EventLog(nil), events...)
-	rt.session.DraftMessage = nil
-	rt.session.ActiveTaskID = ""
-	rt.session.ActiveTurnID = ""
-	rt.stopRequested = false
-	rt.cancelTask = nil
-	rt.session.UpdatedAt = time.Now()
-}
-
-func (s *sessionStore) broadcastSessionSnapshot(sessionID string) {
-	s.mu.RLock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.RUnlock()
-		return
-	}
-	clients := cloneClients(rt.clients)
-	s.mu.RUnlock()
-
-	meta := s.metaForSession(sessionID)
-	broadcastJSON(clients, serverEvent{
-		Type:    "snapshot",
-		Session: s.cloneSession(sessionID),
-		Running: false,
-		Meta:    &meta,
+		execMu.Lock()
+		defer execMu.Unlock()
+		s.appendSessionEvent(sessionID, event)
 	})
-}
-
-func (s *sessionStore) applyRecoveredCodexThread(sessionID string, thread map[string]interface{}) {
-	threadID := strings.TrimSpace(firstNonEmpty(
-		lookupNestedString(thread, "id"),
-		lookupNestedString(thread, "thread.id"),
-	))
-	messages, events := buildCodexHistoryTimeline(thread)
-	s.replaceTimeline(sessionID, messages, events)
-	if threadID != "" {
-		s.updateThreadID(sessionID, threadID)
-	}
-	if workdir := strings.TrimSpace(lookupNestedString(thread, "cwd")); workdir != "" {
-		s.mu.Lock()
-		if rt, ok := s.sessions[sessionID]; ok {
-			rt.session.Workdir = normalizeWorkdir(workdir)
-			rt.session.UpdatedAt = time.Now()
-		}
-		s.mu.Unlock()
-	}
-	if s.app != nil && threadID != "" {
-		s.app.recordThreadSession(sessionID, threadID, false)
-	}
-	s.broadcastSessionSnapshot(sessionID)
-}
-
-func cloneMessagePtr(msg *Message) *Message {
-	if msg == nil {
-		return nil
-	}
-	copyMsg := *msg
-	if len(msg.ImageURLs) > 0 {
-		copyMsg.ImageURLs = append([]string(nil), msg.ImageURLs...)
-	}
-	return &copyMsg
-}
-
-func (s *sessionStore) hydrateCodexSession(ctx context.Context, sessionID, threadID string) error {
-	thread, err := s.app.ReadThread(ctx, threadID)
 	if err != nil {
-		return err
-	}
-	s.applyRecoveredCodexThread(sessionID, thread)
-	return nil
-}
-
-type recoveredTurnOutcome struct {
-	Done    bool
-	Summary string
-	Err     error
-}
-
-func detectRecoveredTurnOutcome(thread map[string]interface{}, session *Session, prompt string, startedAt time.Time) recoveredTurnOutcome {
-	target := selectRecoveredTurn(thread, session, prompt, startedAt)
-	if target == nil {
-		return recoveredTurnOutcome{}
-	}
-
-	status := strings.ToLower(strings.TrimSpace(itemField(target, "status")))
-	switch status {
-	case "completed", "complete", "succeeded", "success":
-		return recoveredTurnOutcome{
-			Done:    true,
-			Summary: "远端线程显示该任务已经完成，已按远端结果恢复当前会话。",
-		}
-	case "failed", "error", "interrupted", "cancelled", "canceled":
-		message := firstNonEmpty(
-			lookupNestedString(target, "error.message"),
-			itemField(target, "error.message"),
-			"任务执行失败",
-		)
-		return recoveredTurnOutcome{
-			Done:    true,
-			Summary: "远端线程显示该任务已经失败，已同步失败状态和错误信息。",
-			Err:     errors.New(strings.TrimSpace(message)),
-		}
-	}
-
-	if turnHasAssistantMessage(target) {
-		return recoveredTurnOutcome{
-			Done:    true,
-			Summary: "远端线程里已经有助手回复，已直接用远端内容补全当前会话。",
-		}
-	}
-
-	return recoveredTurnOutcome{}
-}
-
-func selectRecoveredTurn(thread map[string]interface{}, session *Session, prompt string, startedAt time.Time) map[string]interface{} {
-	turnValues, _ := nestedValue(thread, "turns").([]interface{})
-	if len(turnValues) == 0 {
-		return nil
-	}
-
-	activeTurnID := ""
-	if session != nil {
-		activeTurnID = strings.TrimSpace(session.ActiveTurnID)
-	}
-	if activeTurnID != "" {
-		for i := len(turnValues) - 1; i >= 0; i-- {
-			turn, _ := turnValues[i].(map[string]interface{})
-			if turn == nil {
-				continue
-			}
-			turnID := strings.TrimSpace(firstNonEmpty(
-				itemField(turn, "id", "turnId", "turn_id"),
-				lookupNestedString(turn, "turn.id"),
-			))
-			if turnID == activeTurnID {
-				return turn
-			}
-		}
-	}
-
-	prompt = strings.TrimSpace(prompt)
-	for i := len(turnValues) - 1; i >= 0; i-- {
-		turn, _ := turnValues[i].(map[string]interface{})
-		if turn == nil {
-			continue
-		}
-		if prompt != "" && turnMatchesPrompt(turn, prompt) {
-			return turn
-		}
-		if turnUpdatedAfter(turn, startedAt) {
-			return turn
-		}
-	}
-
-	return nil
-}
-
-func turnMatchesPrompt(turn map[string]interface{}, prompt string) bool {
-	prompt = strings.TrimSpace(prompt)
-	if prompt == "" {
-		return false
-	}
-	itemValues, _ := nestedValue(turn, "items").([]interface{})
-	for _, itemValue := range itemValues {
-		item, ok := itemValue.(map[string]interface{})
-		if !ok || normalizeItemType(itemField(item, "type")) != "usermessage" {
-			continue
-		}
-		content, _ := codexUserMessageParts(item)
-		return strings.TrimSpace(content) == prompt
-	}
-	return false
-}
-
-func turnHasAssistantMessage(turn map[string]interface{}) bool {
-	itemValues, _ := nestedValue(turn, "items").([]interface{})
-	for _, itemValue := range itemValues {
-		item, ok := itemValue.(map[string]interface{})
-		if !ok || normalizeItemType(itemField(item, "type")) != "agentmessage" {
-			continue
-		}
-		if strings.TrimSpace(itemField(item, "text")) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func turnUpdatedAfter(turn map[string]interface{}, t time.Time) bool {
-	if t.IsZero() {
-		return false
-	}
-	candidates := []interface{}{
-		nestedValue(turn, "updatedAt"),
-		nestedValue(turn, "createdAt"),
-		nestedValue(turn, "updated_at"),
-		nestedValue(turn, "created_at"),
-	}
-	for _, candidate := range candidates {
-		switch value := candidate.(type) {
-		case float64:
-			if time.Unix(int64(value), 0).After(t) {
-				return true
-			}
-		case int64:
-			if time.Unix(value, 0).After(t) {
-				return true
-			}
-		case int:
-			if time.Unix(int64(value), 0).After(t) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func buildCodexHistoryTimeline(thread map[string]interface{}) ([]Message, []EventLog) {
-	turnValues, _ := nestedValue(thread, "turns").([]interface{})
-	if len(turnValues) == 0 {
-		return []Message{}, []EventLog{}
-	}
-
-	baseUnix := time.Now().Unix()
-	if updatedAt, ok := nestedValue(thread, "updatedAt").(float64); ok && updatedAt > 0 {
-		baseUnix = int64(updatedAt)
-	} else if createdAt, ok := nestedValue(thread, "createdAt").(float64); ok && createdAt > 0 {
-		baseUnix = int64(createdAt)
-	}
-	baseTime := time.Unix(baseUnix, 0)
-
-	messages := make([]Message, 0, len(turnValues)*2)
-	events := make([]EventLog, 0, len(turnValues)*4)
-	stepIndex := 0
-
-	nextTime := func() time.Time {
-		t := baseTime.Add(time.Duration(stepIndex) * time.Millisecond)
-		stepIndex++
-		return t
-	}
-
-	for _, turnValue := range turnValues {
-		turn, ok := turnValue.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		itemValues, _ := nestedValue(turn, "items").([]interface{})
-		for _, itemValue := range itemValues {
-			item, ok := itemValue.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			itemType := normalizeItemType(itemField(item, "type"))
-			switch itemType {
-			case "usermessage":
-				content, images := codexUserMessageParts(item)
-				messages = append(messages, Message{
-					ID:        firstNonEmpty(itemField(item, "id"), uuid.NewString()),
-					Role:      "user",
-					Content:   content,
-					ImageURLs: images,
-					CreatedAt: nextTime(),
-				})
-			case "agentmessage":
-				messages = append(messages, Message{
-					ID:        firstNonEmpty(itemField(item, "id"), uuid.NewString()),
-					Role:      "assistant",
-					Content:   itemField(item, "text"),
-					CreatedAt: nextTime(),
-				})
-			case "reasoning":
-				body := strings.Join(stringsFromValue(nestedValue(item, "summary")), "\n")
-				if strings.TrimSpace(body) == "" {
-					body = itemType
-				}
-				events = append(events, EventLog{
-					ID:        uuid.NewString(),
-					Kind:      "status",
-					Category:  "step",
-					StepType:  "reasoning",
-					Phase:     "completed",
-					Target:    "reasoning",
-					Title:     "reasoning",
-					Body:      body,
-					CreatedAt: nextTime(),
-				})
-			case "commandexecution":
-				title := "shell command completed"
-				if status := strings.ToLower(strings.TrimSpace(itemField(item, "status"))); status == "failed" {
-					title = "shell command failed"
-				}
-				body := strings.TrimSpace(itemField(item, "command"))
-				output := strings.TrimSpace(itemField(item, "aggregatedOutput", "aggregated_output"))
-				if output != "" {
-					if body != "" {
-						body += "\n\n"
-					}
-					body += output
-				}
-				events = append(events, EventLog{
-					ID:        uuid.NewString(),
-					Kind:      "command",
-					Category:  "command",
-					StepType:  "shell_command",
-					Phase:     "completed",
-					Target:    firstLine(body),
-					Title:     title,
-					Body:      body,
-					CreatedAt: nextTime(),
-				})
-			case "filechange":
-				body := summarizeFileChange(item)
-				if body == "" {
-					body = itemType
-				}
-				events = append(events, EventLog{
-					ID:        uuid.NewString(),
-					Kind:      "status",
-					Category:  "step",
-					StepType:  "filechange",
-					Phase:     "completed",
-					Target:    body,
-					Title:     "file change",
-					Body:      body,
-					CreatedAt: nextTime(),
-				})
-			case "websearch":
-				body := summarizeWebSearch(item)
-				if body == "" {
-					body = itemType
-				}
-				events = append(events, EventLog{
-					ID:        uuid.NewString(),
-					Kind:      "status",
-					Category:  "step",
-					StepType:  "websearch",
-					Phase:     "completed",
-					Target:    body,
-					Title:     "web search",
-					Body:      body,
-					CreatedAt: nextTime(),
-				})
-			}
-		}
-
-		if strings.EqualFold(strings.TrimSpace(itemField(turn, "status")), "failed") {
-			message := firstNonEmpty(
-				lookupNestedString(turn, "error.message"),
-				itemField(turn, "error", "message"),
-				"任务执行失败",
-			)
-			messages = append(messages, Message{
-				ID:        uuid.NewString(),
-				Role:      "system",
-				Content:   "任务执行失败：" + strings.TrimSpace(message),
-				CreatedAt: nextTime(),
-			})
-		}
-	}
-
-	return messages, events
-}
-
-func codexUserMessageParts(item map[string]interface{}) (string, []string) {
-	contentValues, _ := nestedValue(item, "content").([]interface{})
-	if len(contentValues) == 0 {
-		return "", nil
-	}
-
-	textParts := make([]string, 0, len(contentValues))
-	imageURLs := make([]string, 0)
-	for _, value := range contentValues {
-		part, ok := value.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		switch normalizeItemType(itemField(part, "type")) {
-		case "text":
-			if text := itemField(part, "text"); strings.TrimSpace(text) != "" {
-				textParts = append(textParts, text)
-			}
-		case "image":
-			if url := itemField(part, "url", "path"); strings.TrimSpace(url) != "" {
-				imageURLs = append(imageURLs, url)
-			}
-		case "localimage":
-			if path := itemField(part, "path"); strings.TrimSpace(path) != "" {
-				imageURLs = append(imageURLs, path)
-			}
-		}
-	}
-	return strings.TrimSpace(strings.Join(textParts, "\n")), imageURLs
-}
-
-func (s *sessionStore) appendEvent(sessionID, kind, title, body string) {
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.Unlock()
+		s.failTask(sessionID, err)
 		return
 	}
 
-	category, stepType, phase, target, count := eventFields(kind, title, body)
-
-	logEntry := EventLog{
-		ID:        uuid.NewString(),
-		Kind:      kind,
-		Category:  category,
-		StepType:  stepType,
-		Phase:     phase,
-		Target:    target,
-		Count:     count,
-		Title:     title,
-		Body:      body,
-		CreatedAt: time.Now(),
-	}
-	rt.session.Events = append(rt.session.Events, logEntry)
-	rt.session.UpdatedAt = time.Now()
-	clients := cloneClients(rt.clients)
-	s.mu.Unlock()
-
-	broadcastJSON(clients, serverEvent{Type: "log", Log: &logEntry})
+	finishSession()
 }
 
-func (s *sessionStore) appendEventToProviderSessions(providerID, kind, title, body string) {
-	providerID = strings.TrimSpace(strings.ToLower(providerID))
-	if providerID == "" {
-		return
-	}
-
-	s.mu.RLock()
-	sessionIDs := make([]string, 0, len(s.sessions))
-	for sessionID, rt := range s.sessions {
-		if firstNonEmpty(strings.TrimSpace(rt.session.Provider), providerCodex) == providerID {
-			sessionIDs = append(sessionIDs, sessionID)
-		}
-	}
-	s.mu.RUnlock()
-
-	for _, sessionID := range sessionIDs {
-		s.appendEvent(sessionID, kind, title, body)
-	}
-}
-
-func (s *sessionStore) updateThreadID(sessionID, threadID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return
-	}
-	if rt.session.CodexThreadID == threadID {
-		return
-	}
-	rt.session.CodexThreadID = threadID
-	rt.session.UpdatedAt = time.Now()
-}
-
-func (s *sessionStore) updateActiveTurn(sessionID, turnID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return
-	}
-	if rt.session.ActiveTurnID == turnID {
-		return
-	}
-	rt.session.ActiveTurnID = turnID
-	rt.session.UpdatedAt = time.Now()
-}
-
-func (s *sessionStore) markStopRequested(sessionID string, requested bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return
-	}
-	rt.stopRequested = requested
-}
-
-func (s *sessionStore) stopRequested(sessionID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return false
-	}
-	return rt.stopRequested
-}
-
-func (s *sessionStore) deleteSession(sessionID string) (bool, error) {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return false, errors.New("missing session id")
-	}
-
-	s.mu.Lock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.Unlock()
-		return false, nil
-	}
-	if rt.session.ActiveTaskID != "" {
-		s.mu.Unlock()
-		return false, errors.New("任务执行中，先用 /stop 终止")
-	}
-	clients := cloneClients(rt.clients)
-	session := *rt.session
-	delete(s.sessions, sessionID)
-	s.mu.Unlock()
-	for client := range clients {
-		closeClientConn(client)
-	}
-	if s.app != nil {
-		s.app.ForgetSession(sessionID, session.CodexThreadID, session.ActiveTurnID)
-	}
-	return true, nil
-}
-
-func (s *sessionStore) broadcast(sessionID string, event serverEvent) {
-	s.mu.RLock()
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		s.mu.RUnlock()
-		return
-	}
-	clients := cloneClients(rt.clients)
-	s.mu.RUnlock()
-
-	broadcastJSON(clients, event)
-}
-
-func (s *sessionStore) cloneSession(sessionID string) *Session {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	rt, ok := s.sessions[sessionID]
-	if !ok {
-		return nil
-	}
-	cp := *rt.session
-	cp.RestoreRef = sessionRestoreRef(rt.session)
-	cp.Messages = append([]Message(nil), rt.session.Messages...)
-	cp.Events = append([]EventLog(nil), rt.session.Events...)
-	if rt.session.DraftMessage != nil {
-		draft := *rt.session.DraftMessage
-		cp.DraftMessage = &draft
-	}
-	return &cp
-}
-
-func (s *sessionStore) listSessions() []sessionSummary {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	items := make([]sessionSummary, 0, len(s.sessions))
-	for _, rt := range s.sessions {
-		session := rt.session
-		summary := sessionSummary{
-			RestoreRef:        sessionRestoreRef(session),
-			ID:                session.ID,
-			Provider:          firstNonEmpty(session.Provider, providerCodex),
-			Model:             firstNonEmpty(strings.TrimSpace(session.Model), defaultModelForProviderID(session.Provider)),
-			Workdir:           normalizeWorkdir(session.Workdir),
-			CodexThreadID:     strings.TrimSpace(session.CodexThreadID),
-			ProviderSessionID: strings.TrimSpace(session.ProviderSessionID),
-			UpdatedAt:         session.UpdatedAt,
-			MessageCount:      len(session.Messages),
-			Running:           session.ActiveTaskID != "",
-		}
-		for i := len(session.Messages) - 1; i >= 0; i-- {
-			msg := session.Messages[i]
-			if strings.TrimSpace(msg.Role) != "user" {
-				continue
-			}
-			summary.LastMessage = compactForSummary(strings.TrimSpace(msg.Content))
-			break
-		}
-		for i := len(session.Events) - 1; i >= 0; i-- {
-			event := session.Events[i]
-			if event.Category == "step" && strings.TrimSpace(event.Target) != "" {
-				summary.LastEvent = compactForSummary(stepSummaryText(event))
-				break
-			}
-		}
-		items = append(items, summary)
-	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].UpdatedAt.After(items[j].UpdatedAt)
-	})
-	return items
-}
-
-func (s *sessionStore) hasActiveCodexTask() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for _, rt := range s.sessions {
-		if firstNonEmpty(strings.TrimSpace(rt.session.Provider), providerCodex) != providerCodex {
-			continue
-		}
-		if strings.TrimSpace(rt.session.ActiveTaskID) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *sessionStore) findSessionByThread(threadID string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for sessionID, rt := range s.sessions {
-		if rt.session.CodexThreadID == threadID {
-			return sessionID
-		}
-	}
-	return ""
-}
-
-func (s *sessionStore) findActiveSessionByThread(threadID string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	threadID = strings.TrimSpace(threadID)
-	if threadID == "" {
-		return ""
-	}
-	for sessionID, rt := range s.sessions {
-		if strings.TrimSpace(rt.session.CodexThreadID) != threadID {
-			continue
-		}
-		if strings.TrimSpace(rt.session.ActiveTaskID) != "" {
-			return sessionID
-		}
-	}
-	return ""
-}
-
-func (s *sessionStore) findSessionByTurn(turnID string) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	turnID = strings.TrimSpace(turnID)
-	if turnID == "" {
-		return ""
-	}
-	for sessionID, rt := range s.sessions {
-		if strings.TrimSpace(rt.session.ActiveTurnID) == turnID {
-			return sessionID
-		}
-	}
-	return ""
-}
-
+// saveMultipartImages 保存发送请求里附带的图片，并返回文件名列表。
 func (s *sessionStore) saveMultipartImages(files []*multipart.FileHeader) ([]string, error) {
 	imageIDs := make([]string, 0, len(files))
 	for _, header := range files {
@@ -1564,11 +584,448 @@ func (s *sessionStore) saveMultipartImages(files []*multipart.FileHeader) ([]str
 			return nil, err
 		}
 		filename, err := saveUploadedFile(file, header)
-		file.Close()
+		_ = file.Close()
 		if err != nil {
 			return nil, err
 		}
 		imageIDs = append(imageIDs, filename)
 	}
 	return imageIDs, nil
+}
+
+// updateProviderState 把 provider 返回的会话状态写回当前本地会话。
+func (s *sessionStore) updateProviderState(sessionID string, state *ProviderStateUpdate) {
+	if state == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rt, ok := s.sessions[sessionID]
+	if !ok {
+		return
+	}
+	if value := strings.TrimSpace(state.ProviderSessionID); value != "" {
+		rt.session.ProviderSessionID = value
+	}
+	rt.session.UpdatedAt = time.Now()
+	go func() { _ = s.persistSessions() }()
+}
+
+// failTask 在底层 CLI 执行失败时清理会话状态并广播错误。
+func (s *sessionStore) failTask(sessionID string, err error) {
+	message := "Claude 调用失败"
+	if err != nil && strings.TrimSpace(err.Error()) != "" {
+		message = err.Error()
+	}
+
+	s.mu.Lock()
+	if rt, ok := s.sessions[sessionID]; ok {
+		rt.session.IsRunning = false
+		rt.session.DraftMessage = nil
+		rt.session.UpdatedAt = time.Now()
+	}
+	s.mu.Unlock()
+
+	s.broadcast(sessionID, serverEvent{Type: "error", Error: message})
+	s.broadcast(sessionID, serverEvent{Type: "task_status", Running: false})
+	_ = s.persistSessions()
+}
+
+// markSessionIdle 把会话切换回空闲状态，并刷新更新时间。
+func (s *sessionStore) markSessionIdle(sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if rt, ok := s.sessions[sessionID]; ok {
+		rt.session.IsRunning = false
+		rt.session.UpdatedAt = time.Now()
+	}
+	go func() { _ = s.persistSessions() }()
+}
+
+// appendAssistantDelta 追加流式返回的增量文本，并推送给所有客户端。
+func (s *sessionStore) appendAssistantDelta(sessionID, draftID, delta string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rt, ok := s.sessions[sessionID]
+	if !ok || rt.session.DraftMessage == nil || rt.session.DraftMessage.ID != draftID {
+		return
+	}
+
+	rt.session.DraftMessage.Content += delta
+	rt.session.UpdatedAt = time.Now()
+	s.broadcastLocked(rt, serverEvent{Type: "message_delta", Message: cloneMessage(rt.session.DraftMessage)})
+	go func() { _ = s.persistSessions() }()
+}
+
+// completeAssistantMessage 把草稿消息转正为最终助手消息。
+func (s *sessionStore) completeAssistantMessage(sessionID, draftID, text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rt, ok := s.sessions[sessionID]
+	if !ok {
+		return
+	}
+
+	if rt.session.DraftMessage != nil && rt.session.DraftMessage.ID == draftID {
+		rt.session.DraftMessage.Content = text
+		finalMessage := cloneMessage(rt.session.DraftMessage)
+		rt.session.Messages = append(rt.session.Messages, finalMessage)
+		rt.session.DraftMessage = nil
+		rt.session.UpdatedAt = time.Now()
+		s.broadcastLocked(rt, serverEvent{Type: "message_final", Message: cloneMessage(finalMessage)})
+		go func() { _ = s.persistSessions() }()
+		return
+	}
+
+	finalMessage := &Message{ID: newUUID(), Role: "assistant", Content: text, CreatedAt: time.Now()}
+	rt.session.Messages = append(rt.session.Messages, finalMessage)
+	rt.session.UpdatedAt = time.Now()
+	s.broadcastLocked(rt, serverEvent{Type: "message_final", Message: cloneMessage(finalMessage)})
+	go func() { _ = s.persistSessions() }()
+}
+
+// appendSessionEvent 追加会话事件，并把工具调用消息广播给所有客户端。
+func (s *sessionStore) appendSessionEvent(sessionID string, event *Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rt, ok := s.sessions[sessionID]
+	if !ok || event == nil {
+		return
+	}
+
+	entry := cloneEvent(event)
+	if strings.TrimSpace(entry.ID) == "" {
+		entry.ID = newUUID()
+	}
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now()
+	}
+	rt.session.Events = append(rt.session.Events, entry)
+	rt.session.UpdatedAt = entry.CreatedAt
+	s.broadcastLocked(rt, serverEvent{Type: "log", Log: cloneEvent(entry)})
+	go func() { _ = s.persistSessions() }()
+}
+
+// broadcast 按会话广播事件给所有已连接客户端。
+func (s *sessionStore) broadcast(sessionID string, event serverEvent) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rt, ok := s.sessions[sessionID]
+	if !ok {
+		return
+	}
+	for client := range rt.clients {
+		select {
+		case client.send <- event:
+		default:
+		}
+	}
+}
+
+// broadcastLocked 在已持锁的前提下把事件写入所有客户端发送队列。
+func (s *sessionStore) broadcastLocked(rt *sessionRuntime, event serverEvent) {
+	for client := range rt.clients {
+		select {
+		case client.send <- event:
+		default:
+		}
+	}
+}
+
+// startClientWriter 持续把发送队列里的事件写入 WebSocket。
+func startClientWriter(client *clientConn) {
+	for event := range client.send {
+		if err := writeClientJSON(client, event); err != nil {
+			closeClientConn(client)
+			return
+		}
+	}
+}
+
+// closeClientConn 安全关闭客户端发送队列和底层连接。
+func closeClientConn(client *clientConn) {
+	if client == nil {
+		return
+	}
+	client.closeOnce.Do(func() {
+		close(client.send)
+		_ = client.conn.Close()
+	})
+}
+
+// writeClientJSON 为单个客户端安全写入一条 JSON 事件。
+func writeClientJSON(client *clientConn, event serverEvent) error {
+	client.writeMu.Lock()
+	defer client.writeMu.Unlock()
+	_ = client.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	err := client.conn.WriteJSON(event)
+	_ = client.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+// cloneSession 深拷贝会话，避免把内部状态直接暴露给调用方。
+func cloneSession(session *Session) *Session {
+	if session == nil {
+		return nil
+	}
+	cloned := *session
+	cloned.Messages = make([]*Message, 0, len(session.Messages))
+	for _, msg := range session.Messages {
+		cloned.Messages = append(cloned.Messages, cloneMessage(msg))
+	}
+	cloned.Events = make([]*Event, 0, len(session.Events))
+	for _, event := range session.Events {
+		cloned.Events = append(cloned.Events, cloneEvent(event))
+	}
+	cloned.DraftMessage = cloneMessage(session.DraftMessage)
+	return &cloned
+}
+
+// cloneMessages 复制消息切片，避免历史恢复时和 provider 内存共享。
+func cloneMessages(items []*Message) []*Message {
+	out := make([]*Message, 0, len(items))
+	for _, item := range items {
+		out = append(out, cloneMessage(item))
+	}
+	return out
+}
+
+// cloneEvents 复制事件切片，避免历史恢复时和 provider 内存共享。
+func cloneEvents(items []*Event) []*Event {
+	out := make([]*Event, 0, len(items))
+	for _, item := range items {
+		out = append(out, cloneEvent(item))
+	}
+	return out
+}
+
+// cloneMessage 复制单条消息，避免共享同一块内存。
+func cloneMessage(message *Message) *Message {
+	if message == nil {
+		return nil
+	}
+	cloned := *message
+	if len(message.ImageURLs) > 0 {
+		cloned.ImageURLs = append([]string(nil), message.ImageURLs...)
+	}
+	return &cloned
+}
+
+// cloneEvent 复制单条事件，避免并发场景下共享同一份内存。
+func cloneEvent(event *Event) *Event {
+	if event == nil {
+		return nil
+	}
+	cloned := *event
+	return &cloned
+}
+
+// writeJSON 以统一的 JSON 响应格式写回 HTTP 客户端。
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// mustJSON 把对象编码成 JSON 字符串，适用于已知不会失败的小对象。
+func mustJSON(value any) string {
+	data, _ := json.Marshal(value)
+	return string(data)
+}
+
+// authTokenForPassword 把登录密码转换成固定 token，便于通过 cookie 判断登录态。
+func authTokenForPassword(password string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(password)))
+	return hex.EncodeToString(sum[:])
+}
+
+// isAuthenticated 判断当前请求是否携带了有效登录 cookie。
+func (s *sessionStore) isAuthenticated(r *http.Request) bool {
+	cookie, err := r.Cookie("code_web_auth")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(cookie.Value) == s.authToken
+}
+
+// withAuth 保护需要登录后才能访问的接口和 WebSocket。
+func (s *sessionStore) withAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/login" || r.URL.Path == "/api/auth" || r.URL.Path == "/" || r.URL.Path == "/index.html" ||
+			r.URL.Path == "/style.css" || r.URL.Path == "/app-config.js" || strings.HasPrefix(r.URL.Path, "/app/") || strings.HasPrefix(r.URL.Path, "/uploads/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !s.isAuthenticated(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// mergeStreamText 合并 provider 返回的文本，兼容“累计文本”和“增量文本”两种流式格式。
+func mergeStreamText(current, incoming string) (next string, delta string) {
+	if incoming == "" {
+		return current, ""
+	}
+	if current == "" {
+		return incoming, incoming
+	}
+	if incoming == current {
+		return current, ""
+	}
+	if strings.HasPrefix(incoming, current) {
+		return incoming, incoming[len(current):]
+	}
+	if strings.HasPrefix(current, incoming) {
+		return current, ""
+	}
+	return current + incoming, incoming
+}
+
+// listSessions 返回已持久化的本地 web 会话列表。
+func (s *sessionStore) listSessions(ctx context.Context) ([]*sessionListItem, error) {
+	_ = ctx
+	s.mu.RLock()
+	items := make([]*sessionListItem, 0, len(s.sessions))
+	for _, rt := range s.sessions {
+		if rt == nil || rt.session == nil {
+			continue
+		}
+		if !isLocalSessionID(rt.session.ID) {
+			continue
+		}
+		item := &sessionListItem{
+			ID:                rt.session.ID,
+			Provider:          rt.session.Provider,
+			Model:             rt.session.Model,
+			Title:             firstMessageSummary(rt.session.Messages),
+			Workdir:           rt.session.Workdir,
+			ProviderSessionID: rt.session.ProviderSessionID,
+			UpdatedAt:         rt.session.UpdatedAt,
+			MessageCount:      len(rt.session.Messages),
+			Running:           rt.session.IsRunning,
+			LastMessage:       lastUserMessage(rt.session.Messages),
+			LastEvent:         lastEventSummary(rt.session.Events),
+		}
+		items = append(items, item)
+	}
+	s.mu.RUnlock()
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].UpdatedAt.After(items[j].UpdatedAt)
+	})
+	return items, nil
+}
+
+// firstMessageSummary 返回会话第一条非空消息摘要，优先用于列表标题展示。
+func firstMessageSummary(items []*Message) string {
+	for _, item := range items {
+		if item != nil && strings.TrimSpace(item.Content) != "" {
+			return compactEventBody(item.Content)
+		}
+	}
+	return ""
+}
+
+// lastUserMessage 返回最近一条用户消息摘要。
+func lastUserMessage(items []*Message) string {
+	for i := len(items) - 1; i >= 0; i-- {
+		if items[i] != nil && items[i].Role == "user" && strings.TrimSpace(items[i].Content) != "" {
+			return compactEventBody(items[i].Content)
+		}
+	}
+	return ""
+}
+
+// lastEventSummary 返回最近一条事件摘要。
+func lastEventSummary(items []*Event) string {
+	for i := len(items) - 1; i >= 0; i-- {
+		if items[i] == nil {
+			continue
+		}
+		if text := firstNonEmptyString(items[i].Target, items[i].Title, items[i].Body); text != "" {
+			return compactEventBody(text)
+		}
+	}
+	return ""
+}
+
+// maxTime 返回两个时间中较晚的那个。
+func maxTime(left, right time.Time) time.Time {
+	if left.After(right) {
+		return left
+	}
+	return right
+}
+
+// normalizeWorkdir 规范化工作目录，空值时回退到当前项目目录。
+func normalizeWorkdir(value string) string {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		if cwd, err := filepath.Abs("."); err == nil {
+			return cwd
+		}
+		return ""
+	}
+	if abs, err := filepath.Abs(text); err == nil {
+		return abs
+	}
+	return text
+}
+
+// providerByName 根据 provider 名称返回对应实现，空值时回退到 claude。
+func (s *sessionStore) providerByName(name string) Provider {
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		key = s.defaultProviderID()
+	}
+	return s.providers[key]
+}
+
+// mustProvider 获取 provider；这里用于已知存在的内置 provider。
+func (s *sessionStore) mustProvider(name string) Provider {
+	return s.providers[name]
+}
+
+// providerBySession 根据会话配置选择真正执行命令的 provider。
+func (s *sessionStore) providerBySession(session *Session) Provider {
+	if session == nil {
+		return s.mustProvider("claude")
+	}
+	if provider := s.providerByName(session.Provider); provider != nil {
+		return provider
+	}
+	return s.mustProvider("claude")
+}
+
+// defaultProviderID 返回当前应用配置中的默认 provider。
+func (s *sessionStore) defaultProviderID() string {
+	if s == nil || s.appConfig == nil {
+		return "claude"
+	}
+	return s.appConfig.defaultProviderID()
+}
+
+// defaultModelForProvider 返回指定 provider 的默认模型。
+func (s *sessionStore) defaultModelForProvider(providerID string) string {
+	if s != nil && s.appConfig != nil {
+		if model := s.appConfig.providerDefaultModel(providerID); model != "" {
+			return model
+		}
+		if models := s.appConfig.providerModels(providerID); len(models) > 0 {
+			return models[0]
+		}
+	}
+	if provider := s.providerByName(providerID); provider != nil {
+		return provider.DefaultModel()
+	}
+	return ""
 }

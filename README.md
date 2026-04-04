@@ -6,7 +6,7 @@
 
 <p align="center">
   <img alt="Go Version" src="https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-v1.1.2-111827">
+  <img alt="Version" src="https://img.shields.io/badge/version-v1.2.0-111827">
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/klsf/code-web?style=social">
 </p>
 <p align="center">
@@ -26,11 +26,11 @@
 
 ## 特性
 
-- `codex` 模式基于 `codex app-server`，不是每条消息都重新启动一次独立 CLI
-- 支持通过 `Claude` headless CLI 执行并续接会话
-- 会话不再落盘到服务端，本地浏览器会保存远端会话引用用于恢复
-- 支持图片随消息一起发送
-- 支持流式输出、`Working...` 状态提示和自动重连
+- 在 `codex` 模式下，基于 `codex app-server` 运行，而不是每次消息都启动一个全新的独立 CLI 进程
+- 通过 `Claude` 的 headless CLI 支持可恢复会话
+- 会话不再持久化到服务端；浏览器会保存远端会话引用，用于后续恢复
+- 支持发送图片
+- 支持流式输出、`working...` 状态提示和自动重连
 - 支持基础 Markdown 渲染
 - 前端静态资源已打包进二进制，无需额外携带 `static/` 目录
 
@@ -38,20 +38,21 @@
 
 1. Go `1.22+`
 2. 机器上可直接执行对应 provider 的 CLI
-    - `codex` 模式：需要 `codex`
-    - `claude` 模式：需要 `claude`
-3. 如果使用 `codex` 模式，还需要先完成 `codex login`
+   - `codex` 模式：需要 `codex`
+   - `claude` 模式：需要 `claude`
+3. 如果使用 `codex` 模式，需要先完成 `codex login`
 
 ## 配置文件
 
-程序默认从二进制所在工作目录读取这两个配置文件：
+默认情况下，程序会从二进制运行目录读取下面两个配置文件：
 
 - `claude-settings.json`
-    - claude会话的配置，可以通过 `claude-settings.json` 配置环境变量，如代理、模型等
+  - 用于配置 Claude 会话
+  - 可通过 `claude-settings.json` 配置代理、模型以及相关环境变量
 - `codex-settings.json`
-    - 当前用于给 `codex app-server` 注入额外环境变量
+  - 当前用于向 `codex app-server` 注入额外环境变量
 
-`claude-settings.json` 格式示例：
+示例 `claude-settings.json`：
 
 ```json
 {
@@ -66,7 +67,7 @@
 }
 ```
 
-`codex-settings.json` 格式示例：
+示例 `codex-settings.json`：
 
 ```json
 {
