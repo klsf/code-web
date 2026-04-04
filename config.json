@@ -1,0 +1,27 @@
+{
+  "appName": "Code Web",
+  "provider": "codex",
+  "providers": [
+    {
+      "id": "claude",
+      "name": "Claude",
+      "defaultModel": "opus",
+      "models": [
+        "opus",
+        "sonnet",
+        "haiku"
+      ]
+    },
+    {
+      "id": "codex",
+      "name": "Codex",
+      "isDefault": true,
+      "defaultModel": "gpt-5.4",
+      "models": [
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gpt-5.4-mini"
+      ]
+    }
+  ]
+}
