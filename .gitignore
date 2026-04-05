@@ -1,23 +1,8 @@
-# Binaries
 code-web
+code-web-linux-amd64
 *.exe
 *.exe~
-*.dll
-*.so
-*.dylib
 
-# Logs
-*.log
-server.log
-
-# Runtime data
-data/log/*
-data/uploads/*
-!data/uploads/.gitkeep
-
-
-# OS / editor
-.DS_Store
 .idea/
 .vscode/
 

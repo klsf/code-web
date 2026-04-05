@@ -9,9 +9,6 @@
   <img alt="Version" src="https://img.shields.io/badge/version-v1.2.0-111827">
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/klsf/code-web?style=social">
 </p>
-<p align="center">
-  中文 | <a href="./README.en.md">English</a>
-</p>
 `Code Web` 是一个基于 `Go + HTML + WebSocket` 构建的代码助手 Web UI，目前支持 `Codex` 和 `Claude`。
 
 它面向移动端和桌面浏览器，目标是把本地代码助手 CLI 的连续会话体验搬到浏览器里：
@@ -28,10 +25,12 @@
 
 - 在 `codex` 模式下，基于 `codex app-server` 运行，而不是每次消息都启动一个全新的独立 CLI 进程
 - 通过 `Claude` 的 headless CLI 支持可恢复会话
-- 会话不再持久化到服务端；浏览器会保存远端会话引用，用于后续恢复
+- 本地会话会持久化到 `data/sessions/`，浏览器刷新或重开后可继续恢复
 - 支持发送图片
-- 支持流式输出、`working...` 状态提示和自动重连
+- 支持流式输出、任务过程事件、自动滚动和自动重连
 - 支持基础 Markdown 渲染
+- 支持按 provider 配置模型列表、默认模型和默认工具
+- 可通过 `config.json` 控制是否持久化 event 过程消息
 - 前端静态资源已打包进二进制，无需额外携带 `static/` 目录
 
 ## 运行要求
@@ -44,13 +43,46 @@
 
 ## 配置文件
 
-默认情况下，程序会从二进制运行目录读取下面两个配置文件：
+默认情况下，程序会从二进制运行目录读取下面三个配置文件：
 
+- `config.json`
+  - 用于配置应用名、登录密码、监听地址、默认 provider、模型列表，以及是否持久化 event
+  - `password` 用于 Web 登录密码
+  - `listen` 用于 HTTP 服务监听地址，例如 `:8080` 或 `0.0.0.0:8080`
+  - `persistEvents` 为 `true` 时，过程事件会写入 `data/sessions/*.json`
+  - `persistEvents` 为 `false` 时，过程事件仍会实时推送到前端，但不会写入本地会话文件
 - `claude-settings.json`
   - 用于配置 Claude 会话
   - 可通过 `claude-settings.json` 配置代理、模型以及相关环境变量
 - `codex-settings.json`
   - 当前用于向 `codex app-server` 注入额外环境变量
+
+示例 `config.json`：
+
+```json
+{
+  "appName": "Code Web",
+  "password": "codex",
+  "listen": ":8080",
+  "provider": "codex",
+  "persistEvents": false,
+  "providers": [
+    {
+      "id": "claude",
+      "name": "Claude",
+      "defaultModel": "opus",
+      "models": ["opus", "sonnet", "haiku"]
+    },
+    {
+      "id": "codex",
+      "name": "Codex",
+      "isDefault": true,
+      "defaultModel": "gpt-5.4",
+      "models": ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"]
+    }
+  ]
+}
+```
 
 示例 `claude-settings.json`：
 
@@ -90,16 +122,12 @@ go build -o code-web
 默认监听：
 
 ```text
-0.0.0.0:991
+0.0.0.0:8080
 ```
 
 ## 登录密码
 
-可通过启动参数设置登录密码：
-
-```bash
-./code-web -password "123456"
-```
+登录密码通过 `config.json` 中的 `password` 配置。
 
 如果没有指定，默认密码是：
 
@@ -112,8 +140,10 @@ codex
 浏览器打开：
 
 ```text
-http://你的服务器IP:991
+http://你的服务器IP:8080
 ```
+
+如果你修改了 `config.json` 里的 `listen`，这里的端口也要对应调整。
 
 ## 反向代理
 
@@ -121,7 +151,7 @@ http://你的服务器IP:991
 
 ```nginx
 location / {
-    proxy_pass http://127.0.0.1:991;
+    proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";

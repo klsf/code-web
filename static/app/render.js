@@ -147,6 +147,15 @@ function compact(text) {
   return String(text || "").replace(/\s+/g, " ").trim().slice(0, 120) || "等待输入";
 }
 
+if (window.marked) {
+  window.marked.setOptions({ breaks: true, gfm: true });
+}
+
+function renderPlainText(node, text) {
+  var bubble = node.querySelector(".bubble");
+  bubble.textContent = String(text || "");
+}
+
 function renderMarkdown(node, text) {
   var bubble = node.querySelector(".bubble");
   var source = String(text || "");
@@ -154,7 +163,6 @@ function renderMarkdown(node, text) {
     bubble.textContent = source;
     return;
   }
-  window.marked.setOptions({ breaks: true, gfm: true });
   bubble.innerHTML = window.DOMPurify.sanitize(window.marked.parse(source));
 }
 
@@ -166,6 +174,10 @@ function messageKey(message, draft) {
 
 function findMessageNode(id) {
   return timeline.querySelector('.bubble-row[data-message-id="' + id + '"]');
+}
+
+function findGroupedEventNode(id) {
+  return timeline.querySelector('[data-group-event-id="' + id + '"]');
 }
 
 function eventKey(event) {
@@ -191,7 +203,11 @@ function renderMessage(message, options) {
   node.querySelector(".bubble-meta").textContent = formatTime(message.createdAt);
   renderImages(node, message.imageUrls || []);
   if (message.role === "assistant") {
-    renderMarkdown(node, message.content || "");
+    if (settings.draft) {
+      renderPlainText(node, message.content || "");
+    } else {
+      renderMarkdown(node, message.content || "");
+    }
   } else {
     node.querySelector(".bubble").textContent = message.content || "";
   }
@@ -219,8 +235,11 @@ function shouldHideEvent(event) {
 
 function renderEvent(event) {
   if (!event || shouldHideEvent(event)) return null;
+  if (isCommandEvent(event)) {
+    return renderCommandEventGroup(event);
+  }
   var key = eventKey(event);
-  var node = findMessageNode(key);
+  var node = findMessageNode(key) || findGroupedEventNode(key);
   if (!node) {
     node = template.content.firstElementChild.cloneNode(true);
     timeline.appendChild(node);
@@ -274,6 +293,118 @@ function renderEvent(event) {
   bubble.appendChild(detailsNode);
   scrollToBottom();
   return node;
+}
+
+function isCommandEvent(event) {
+  return String(event && event.kind || "").toLowerCase() === "command" && !isReasoningEvent(event);
+}
+
+function renderCommandEventGroup(event) {
+  var key = eventKey(event);
+  var existingItem = findGroupedEventNode(key);
+  if (existingItem) {
+    updateCommandGroupSummary(existingItem.closest(".bubble-row"));
+    return existingItem.closest(".bubble-row");
+  }
+
+  var groupNode = timeline.lastElementChild;
+  if (!groupNode || !groupNode.classList || !groupNode.classList.contains("event-command-group")) {
+    groupNode = createCommandGroupNode();
+    timeline.appendChild(groupNode);
+  }
+
+  var listNode = groupNode.querySelector(".event-command-list");
+  var itemNode = document.createElement("div");
+  itemNode.className = "event-command-item";
+  itemNode.dataset.groupEventId = key;
+  itemNode.dataset.eventCreatedAt = String(event.createdAt || "");
+
+  var headNode = document.createElement("div");
+  headNode.className = "event-command-item-head";
+
+  var titleNode = document.createElement("div");
+  titleNode.className = "event-command-item-title";
+  titleNode.textContent = eventTitleText(event) || "命令";
+  headNode.appendChild(titleNode);
+
+  var metaNode = document.createElement("div");
+  metaNode.className = "event-command-item-meta";
+  metaNode.textContent = eventMeta(event);
+  headNode.appendChild(metaNode);
+  itemNode.appendChild(headNode);
+
+  if (event.target) {
+    var targetNode = document.createElement("pre");
+    targetNode.className = "event-command-item-target";
+    targetNode.textContent = event.target;
+    itemNode.appendChild(targetNode);
+  }
+
+  if (event.body) {
+    var bodyNode = document.createElement("pre");
+    bodyNode.className = "event-command-item-body";
+    bodyNode.textContent = reasoningBodyText(event);
+    itemNode.appendChild(bodyNode);
+  }
+
+  listNode.appendChild(itemNode);
+  updateCommandGroupSummary(groupNode);
+  scrollToBottom();
+  return groupNode;
+}
+
+function createCommandGroupNode() {
+  var node = template.content.firstElementChild.cloneNode(true);
+  node.classList.remove("role-user", "role-assistant", "role-system", "is-draft");
+  node.classList.add("role-system", "is-event", "event-command", "event-command-group");
+  node.dataset.messageId = "command-group-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+
+  var metaNode = node.querySelector(".bubble-meta");
+  metaNode.textContent = "command";
+
+  var bubble = node.querySelector(".bubble");
+  bubble.innerHTML = "";
+  bubble.classList.add("event-collapsible");
+
+  var detailsNode = document.createElement("details");
+  detailsNode.className = "event-details event-command-group-details";
+
+  var summaryNode = document.createElement("summary");
+  summaryNode.className = "event-summary";
+
+  var summaryTextNode = document.createElement("span");
+  summaryTextNode.className = "event-summary-text";
+  summaryNode.appendChild(summaryTextNode);
+  detailsNode.appendChild(summaryNode);
+
+  var listNode = document.createElement("div");
+  listNode.className = "event-content event-command-list";
+  detailsNode.appendChild(listNode);
+
+  bubble.appendChild(detailsNode);
+  return node;
+}
+
+function updateCommandGroupSummary(groupNode) {
+  if (!groupNode) return;
+  var items = Array.from(groupNode.querySelectorAll(".event-command-item"));
+  var count = items.length;
+  var lastItem = items[items.length - 1];
+  var metaNode = groupNode.querySelector(".bubble-meta");
+  var summaryTextNode = groupNode.querySelector(".event-summary-text");
+  var lastTitleNode = lastItem ? lastItem.querySelector(".event-command-item-title") : null;
+  var lastCreatedAt = lastItem ? String(lastItem.dataset.eventCreatedAt || "").trim() : "";
+  if (metaNode) {
+    metaNode.textContent = count > 1 ? "command x" + count : "command";
+    if (lastCreatedAt) {
+      metaNode.textContent += " · " + formatTime(lastCreatedAt);
+    }
+  }
+  if (summaryTextNode) {
+    summaryTextNode.textContent = count > 1
+      ? "连续执行了 " + count + " 个命令"
+      : String(lastTitleNode && lastTitleNode.textContent || "执行命令");
+  }
 }
 
 function eventMeta(event) {
@@ -484,7 +615,16 @@ function renderAttachmentTray() {
 
 function scrollToBottom() {
   requestAnimationFrame(function () {
-    timeline.scrollTop = timeline.scrollHeight;
+    var lastItem = timeline && timeline.lastElementChild;
+    if (timeline) {
+      timeline.scrollTop = timeline.scrollHeight;
+    }
+    if (lastItem && typeof lastItem.scrollIntoView === "function") {
+      lastItem.scrollIntoView({ block: "end" });
+    }
+    if (typeof window.scrollTo === "function") {
+      window.scrollTo(0, document.documentElement.scrollHeight || document.body.scrollHeight || 0);
+    }
   });
 }
 
@@ -524,7 +664,7 @@ function setTransportState(state) {
   setNodeText(statusTransport, state);
   setConnectionBanner(state);
   if (!isRunning) {
-    setFooterStatus(state === "connected" ? "ready" : state, transportDetail(state));
+    setFooterStatus(state === "Connected" ? "Ready" : state, transportDetail(state));
   }
 }
 
@@ -535,9 +675,9 @@ function setTaskState(running) {
   sendBtn.disabled = isRunning || !String(input.value || "").trim();
   setNodeText(statusTask, isRunning ? "running" : "idle");
   if (isRunning) {
-    setFooterStatus("working", providerDisplayName() + " 正在生成");
+    setFooterStatus("Working", providerDisplayName() + " 正在生成");
   } else if (String(statusTransport.textContent || "") === "connected") {
-    setFooterStatus("ready", "等待输入");
+    setFooterStatus("Ready", "等待输入");
   }
 }
 
@@ -585,7 +725,7 @@ function applyBuildInfo() {
 
 function showError(message) {
   var text = compact(message || "操作失败");
-  setFooterStatus("error", text);
+  setFooterStatus("Error", text);
   if (!errorToast) return;
   errorToast.textContent = text;
   errorToast.hidden = false;

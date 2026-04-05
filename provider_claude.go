@@ -429,7 +429,7 @@ func (p *ClaudeProvider) readSession(path string) (*Session, error) {
 	return session, nil
 }
 
-func (p *ClaudeProvider) parseStoredUser(entry map[string]any, createdAt time.Time) *Message {
+func (p *ClaudeProvider) parseStoredUser(entry map[string]any, _ time.Time) *Message {
 	message, ok := entry["message"].(map[string]any)
 	if !ok {
 		return nil
@@ -438,6 +438,7 @@ func (p *ClaudeProvider) parseStoredUser(entry map[string]any, createdAt time.Ti
 	if text == "" {
 		return nil
 	}
+	createdAt := time.Now()
 	return &Message{
 		ID:        firstNonEmptyString(anyString(entry["uuid"]), anyString(entry["sessionId"])+"-"+createdAt.Format(time.RFC3339Nano)),
 		Role:      "user",
@@ -446,7 +447,7 @@ func (p *ClaudeProvider) parseStoredUser(entry map[string]any, createdAt time.Ti
 	}
 }
 
-func (p *ClaudeProvider) parseStoredAssistant(entry map[string]any, createdAt time.Time) (*Message, string) {
+func (p *ClaudeProvider) parseStoredAssistant(entry map[string]any, _ time.Time) (*Message, string) {
 	message, ok := entry["message"].(map[string]any)
 	if !ok {
 		return nil, ""
@@ -455,6 +456,7 @@ func (p *ClaudeProvider) parseStoredAssistant(entry map[string]any, createdAt ti
 	if text == "" {
 		return nil, anyString(message["model"])
 	}
+	createdAt := time.Now()
 	return &Message{
 		ID:        firstNonEmptyString(anyString(entry["uuid"]), anyString(entry["sessionId"])+"-"+createdAt.Format(time.RFC3339Nano)),
 		Role:      "assistant",

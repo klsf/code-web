@@ -9,9 +9,12 @@ import (
 const appConfigFile = "config.json"
 
 type appConfig struct {
-	AppName   string               `json:"appName"`
-	Provider  string               `json:"provider"`
-	Providers []*appProviderConfig `json:"providers"`
+	AppName       string               `json:"appName"`
+	Password      string               `json:"password"`
+	Listen        string               `json:"listen"`
+	Provider      string               `json:"provider"`
+	PersistEvents bool                 `json:"persistEvents"`
+	Providers     []*appProviderConfig `json:"providers"`
 }
 
 type appProviderConfig struct {
@@ -39,9 +42,16 @@ func loadAppConfig() *appConfig {
 	if text := strings.TrimSpace(loaded.AppName); text != "" {
 		cfg.AppName = text
 	}
+	if text := strings.TrimSpace(loaded.Password); text != "" {
+		cfg.Password = text
+	}
+	if text := strings.TrimSpace(loaded.Listen); text != "" {
+		cfg.Listen = normalizeListenAddr(text)
+	}
 	if text := strings.TrimSpace(loaded.Provider); text != "" {
 		cfg.Provider = strings.ToLower(text)
 	}
+	cfg.PersistEvents = loaded.PersistEvents
 	if len(loaded.Providers) > 0 {
 		items := make([]*appProviderConfig, 0, len(loaded.Providers))
 		for _, item := range loaded.Providers {
@@ -65,13 +75,30 @@ func loadAppConfig() *appConfig {
 // defaultAppConfig 返回项目内置默认配置。
 func defaultAppConfig() *appConfig {
 	return &appConfig{
-		AppName:  "AI Chat",
-		Provider: "claude",
+		AppName:       "AI Chat",
+		Password:      "codex",
+		Listen:        ":8080",
+		Provider:      "claude",
+		PersistEvents: false,
 		Providers: []*appProviderConfig{
 			{ID: "claude", Name: "Claude", Models: []string{"sonnet", "opus", "haiku"}, DefaultModel: "sonnet", Available: true, IsDefault: true},
-			{ID: "codex", Name: "Codex", Models: []string{"gpt-5", "gpt-5-mini", "gpt-4.1"}, DefaultModel: "gpt-5", Available: true, IsDefault: false},
+			{ID: "codex", Name: "Codex", Models: []string{"gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"}, DefaultModel: "gpt-5.4", Available: true, IsDefault: false},
 		},
 	}
+}
+
+func normalizeListenAddr(value string) string {
+	text := strings.TrimSpace(value)
+	if text == "" {
+		return ":8080"
+	}
+	if strings.HasPrefix(text, ":") {
+		return text
+	}
+	if !strings.Contains(text, ":") {
+		return ":" + text
+	}
+	return text
 }
 
 // normalizeProviderConfig 规范化单个 provider 配置。

@@ -4,7 +4,6 @@ import (
 	"context"
 	"embed"
 	"errors"
-	"flag"
 	"io/fs"
 	"log"
 	"net/http"
@@ -18,8 +17,7 @@ import (
 var embeddedStatic embed.FS
 
 func main() {
-	passwordFlag := flag.String("password", "codex", "login password for Code Web New")
-	flag.Parse()
+	cfg := loadAppConfig()
 
 	staticFS, err := fs.Sub(embeddedStatic, "static")
 	if err != nil {
@@ -29,7 +27,7 @@ func main() {
 		log.Fatalf("init uploads dir: %v", err)
 	}
 
-	store := newSessionStore(*passwordFlag)
+	store := newSessionStore()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", store.handleIndex(staticFS))
@@ -49,7 +47,7 @@ func main() {
 	mux.HandleFunc("/ws", store.handleWS)
 
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    cfg.Listen,
 		Handler: store.withAuth(mux),
 	}
 

@@ -140,17 +140,15 @@
       <form id="composer" class="composer">
         <footer class="status-strip">
           <span id="footerState">ready</span>
-          <span id="modelBadge">unknown</span>
-          <span id="cwdBadge">/</span>
           <span id="footerDetail">waiting for input</span>
-        </footer>
-        <section id="attachmentTray" class="attachment-tray"></section>
-        <div class="composer-toolbar">
-          <label class="composer-select-wrap" for="modelSelect">
+          <label class="composer-select-wrap composer-select-inline" for="modelSelect">
             <span class="composer-select-label">模型</span>
             <select id="modelSelect" class="composer-select" aria-label="选择模型"></select>
           </label>
-        </div>
+          <span id="modelBadge">unknown</span>
+          <span id="cwdBadge">/</span>
+        </footer>
+        <section id="attachmentTray" class="attachment-tray"></section>
         <div class="composer-main">
           <textarea id="promptInput" rows="1" spellcheck="false" placeholder="发送消息，Shift + Enter 换行"></textarea>
           <input id="imageInput" type="file" accept="image/*" multiple hidden>

@@ -1,6 +1,9 @@
 {
   "appName": "Code Web",
+  "password": "codex",
+  "listen": ":8080",
   "provider": "codex",
+  "persistEvents": false,
   "providers": [
     {
       "id": "claude",

@@ -44,7 +44,11 @@ func (s *sessionStore) persistSessions() error {
 		if rt == nil || rt.session == nil || !isLocalSessionID(rt.session.ID) {
 			continue
 		}
-		sessions = append(sessions, cloneSession(rt.session))
+		session := cloneSession(rt.session)
+		if s.appConfig != nil && !s.appConfig.PersistEvents {
+			session.Events = []*Event{}
+		}
+		sessions = append(sessions, session)
 	}
 	s.mu.RUnlock()
 

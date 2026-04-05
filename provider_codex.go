@@ -28,11 +28,15 @@ type codexStreamPayload struct {
 		} `json:"content"`
 	} `json:"item"`
 	Payload struct {
-		Type    string `json:"type"`
-		Role    string `json:"role"`
-		Text    string `json:"text"`
-		Message string `json:"message"`
-		Content []struct {
+		Type             string `json:"type"`
+		Name             string `json:"name"`
+		Role             string `json:"role"`
+		Text             string `json:"text"`
+		Message          string `json:"message"`
+		Phase            string `json:"phase"`
+		Arguments        string `json:"arguments"`
+		LastAgentMessage string `json:"last_agent_message"`
+		Content          []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
@@ -175,12 +179,22 @@ func (p *CodexProvider) Exec(ctx context.Context, session *Session, prompt strin
 			}
 			if state != nil {
 				onState(state)
-				if text := strings.TrimSpace(state.FinalText); text != "" && !finalDelivered {
-					onFinal(text)
+				if text := strings.TrimSpace(state.FinalText); text != "" {
 					finalText = text
 					current = text
-					finalDelivered = true
-					continue
+				}
+				if state.IsComplete && !finalDelivered {
+					text := strings.TrimSpace(state.FinalText)
+					if text == "" {
+						text = strings.TrimSpace(finalText)
+					}
+					if text != "" {
+						onFinal(text)
+						finalText = text
+						current = text
+						finalDelivered = true
+						continue
+					}
 				}
 			}
 			if event := p.parseCodexEventLine(line); event != nil {
@@ -243,6 +257,49 @@ func (p *CodexProvider) parseCodexEventLine(line string) *Event {
 	}
 
 	topType := strings.ToLower(strings.TrimSpace(anyString(payload["type"])))
+	if topType == "event_msg" {
+		eventPayload, _ := payload["payload"].(map[string]any)
+		eventType := strings.ToLower(strings.TrimSpace(anyString(eventPayload["type"])))
+		if eventType == "agent_message" {
+			phase := strings.ToLower(strings.TrimSpace(anyString(eventPayload["phase"])))
+			body := compactEventBody(anyString(eventPayload["message"]))
+			if body == "" || phase == "final_answer" {
+				return nil
+			}
+			return &Event{
+				ID:        newUUID(),
+				Kind:      "status",
+				Category:  "step",
+				StepType:  "agent_message",
+				Phase:     firstNonEmptyString(phase, "started"),
+				Title:     "进度更新",
+				Body:      body,
+				CreatedAt: time.Now(),
+			}
+		}
+		return nil
+	}
+	if topType == "response_item" {
+		responsePayload, _ := payload["payload"].(map[string]any)
+		responseType := strings.ToLower(strings.TrimSpace(anyString(responsePayload["type"])))
+		responseName := strings.ToLower(strings.TrimSpace(anyString(responsePayload["name"])))
+		if responseType == "function_call" && responseName == "update_plan" {
+			body := strings.TrimSpace(formatUpdatePlanEvent(anyString(responsePayload["arguments"])))
+			if body == "" {
+				return nil
+			}
+			return &Event{
+				ID:        newUUID(),
+				Kind:      "status",
+				Category:  "step",
+				StepType:  "todo_list",
+				Phase:     "started",
+				Title:     "todo list",
+				Body:      body,
+				CreatedAt: time.Now(),
+			}
+		}
+	}
 	item, _ := payload["item"].(map[string]any)
 	itemType := strings.ToLower(strings.TrimSpace(anyString(item["type"])))
 	if itemType == "" {
@@ -360,15 +417,38 @@ func (p *CodexProvider) parseCodexStreamLine(line string) (text string, errText 
 		}
 		return "", "codex exec failed", state
 	}
+	if topType == "event_msg" &&
+		strings.EqualFold(strings.TrimSpace(payload.Payload.Type), "agent_message") &&
+		strings.EqualFold(strings.TrimSpace(payload.Payload.Phase), "final_answer") {
+		if text := strings.TrimSpace(payload.Payload.Message); text != "" {
+			if state == nil {
+				state = &ProviderStateUpdate{}
+			}
+			state.FinalText = text
+			return "", "", state
+		}
+	}
+	if topType == "event_msg" && strings.EqualFold(strings.TrimSpace(payload.Payload.Type), "task_complete") {
+		if state == nil {
+			state = &ProviderStateUpdate{}
+		}
+		if text := strings.TrimSpace(payload.Payload.LastAgentMessage); text != "" {
+			state.FinalText = text
+		}
+		return "", "", state
+	}
 	if topType == "response_item" &&
 		strings.EqualFold(strings.TrimSpace(payload.Payload.Type), "message") &&
 		strings.EqualFold(strings.TrimSpace(payload.Payload.Role), "assistant") {
+		phase := strings.ToLower(strings.TrimSpace(payload.Payload.Phase))
+		if phase == "commentary" {
+			return "", "", state
+		}
 		if text := strings.TrimSpace(payload.Payload.Text); text != "" {
 			if state == nil {
 				state = &ProviderStateUpdate{}
 			}
 			state.FinalText = text
-			state.IsComplete = true
 			return "", "", state
 		}
 		var parts []string
@@ -384,21 +464,12 @@ func (p *CodexProvider) parseCodexStreamLine(line string) (text string, errText 
 				state = &ProviderStateUpdate{}
 			}
 			state.FinalText = strings.Join(parts, "\n\n")
-			state.IsComplete = true
 			return "", "", state
 		}
 	}
 	itemType := strings.ToLower(strings.TrimSpace(payload.Item.Type))
 	if itemType == "agentmessage" || itemType == "agent_message" || itemType == "assistant_message" {
 		if text := strings.TrimSpace(payload.Item.Text); text != "" {
-			if topType == "item.completed" {
-				if state == nil {
-					state = &ProviderStateUpdate{}
-				}
-				state.FinalText = text
-				state.IsComplete = true
-				return "", "", state
-			}
 			return text, "", state
 		}
 		var parts []string
@@ -409,14 +480,6 @@ func (p *CodexProvider) parseCodexStreamLine(line string) (text string, errText 
 		}
 		if len(parts) > 0 {
 			text := strings.Join(parts, "\n\n")
-			if topType == "item.completed" {
-				if state == nil {
-					state = &ProviderStateUpdate{}
-				}
-				state.FinalText = text
-				state.IsComplete = true
-				return "", "", state
-			}
 			return text, "", state
 		}
 	}
@@ -424,6 +487,40 @@ func (p *CodexProvider) parseCodexStreamLine(line string) (text string, errText 
 		return strings.TrimSpace(payload.Item.Text), "", state
 	}
 	return "", "", state
+}
+
+func formatUpdatePlanEvent(arguments string) string {
+	arguments = strings.TrimSpace(arguments)
+	if arguments == "" {
+		return ""
+	}
+	var payload struct {
+		Explanation string `json:"explanation"`
+		Plan        []struct {
+			Step   string `json:"step"`
+			Status string `json:"status"`
+		} `json:"plan"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &payload); err != nil {
+		return arguments
+	}
+	parts := make([]string, 0, len(payload.Plan)+1)
+	if text := strings.TrimSpace(payload.Explanation); text != "" {
+		parts = append(parts, text)
+	}
+	for _, item := range payload.Plan {
+		step := strings.TrimSpace(item.Step)
+		if step == "" {
+			continue
+		}
+		status := strings.TrimSpace(item.Status)
+		if status == "" {
+			parts = append(parts, "- "+step)
+			continue
+		}
+		parts = append(parts, "- ["+status+"] "+step)
+	}
+	return strings.Join(parts, "\n")
 }
 
 type codexTranscriptEnvelope struct {
@@ -540,7 +637,7 @@ func (p *CodexProvider) readSession(path, sessionID string) (*Session, error) {
 		ID:                sessionID,
 		ProviderSessionID: sessionID,
 		Provider:          "codex",
-		Model:             "gpt-5",
+		Model:             "gpt-5.4",
 		Messages:          make([]*Message, 0, 32),
 		IsRunning:         false,
 		UpdatedAt:         time.Time{},
@@ -616,11 +713,12 @@ func (p *CodexProvider) firstMessageText(messages []*Message) string {
 	return ""
 }
 
-func (p *CodexProvider) parseStoredMessage(sessionID string, event codexTranscriptEvent, createdAt time.Time) *Message {
+func (p *CodexProvider) parseStoredMessage(sessionID string, event codexTranscriptEvent, _ time.Time) *Message {
 	text := strings.TrimSpace(event.Message)
 	if text == "" {
 		return nil
 	}
+	createdAt := time.Now()
 	role := ""
 	switch strings.TrimSpace(event.Type) {
 	case "user_message":

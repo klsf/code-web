@@ -166,13 +166,13 @@ function connect() {
     if (data.type === "message_delta" && data.message) {
       removeDraftMessages();
       renderMessage(data.message, { draft: true });
-      setFooterStatus("working", providerDisplayName() + " 正在输出");
+      setFooterStatus("Working", providerDisplayName() + " 正在输出");
       return;
     }
     if (data.type === "message_final" && data.message) {
       removeDraftMessages(data.message.id);
       renderMessage(data.message);
-      setFooterStatus("ready", "本轮回复已完成");
+      setFooterStatus("Ready", "本轮回复已完成");
       return;
     }
     if (data.type === "log" && data.log) {
@@ -224,7 +224,7 @@ async function sendPrompt() {
 
   ensureSocket();
   setTaskState(true);
-  setFooterStatus("working", compact(content || ("已附加 " + pendingImages.length + " 张图片")));
+  setFooterStatus("Working", compact(content || ("已附加 " + pendingImages.length + " 张图片")));
 
   try {
     var res = await fetch("/api/send", { method: "POST", credentials: "same-origin", body: formData });
@@ -270,7 +270,7 @@ async function switchProvider(providerID) {
 
   try {
     await createSession(statusCwd.textContent || workdirInput.value, true, nextProvider);
-    setFooterStatus("ready", "已切换到 " + providerDisplayName(nextProvider));
+    setFooterStatus("Ready", "已切换到 " + providerDisplayName(nextProvider));
   } catch (err) {
     showError(err && err.message ? err.message : "切换会话失败");
   }

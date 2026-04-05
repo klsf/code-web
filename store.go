@@ -62,8 +62,9 @@ type sessionListItem struct {
 }
 
 // newSessionStore 创建包含 Claude 和 Codex 的最小会话存储。
-func newSessionStore(password string) *sessionStore {
+func newSessionStore() *sessionStore {
 	cfg := loadAppConfig()
+	password := strings.TrimSpace(cfg.Password)
 	store := &sessionStore{
 		sessions: map[string]*sessionRuntime{},
 		providers: map[string]Provider{
@@ -71,7 +72,7 @@ func newSessionStore(password string) *sessionStore {
 			"codex":  &CodexProvider{},
 		},
 		appConfig:    cfg,
-		authPassword: strings.TrimSpace(password),
+		authPassword: password,
 		authToken:    authTokenForPassword(password),
 	}
 	if err := store.loadPersistedSessions(); err != nil {
@@ -489,7 +490,7 @@ func (s *sessionStore) enqueuePrompt(sessionID, content, model string, imageIDs 
 	}
 
 	now := time.Now()
-	userMessage := &Message{ID: newUUID(), Role: "user", Content: content, ImageURLs: append([]string(nil), imageURLs...), CreatedAt: now}
+	userMessage := &Message{ID: newUUID(), Role: "user", Content: content, ImageURLs: append([]string(nil), imageURLs...), CreatedAt: time.Now()}
 	rt.session.Messages = append(rt.session.Messages, userMessage)
 	rt.session.IsRunning = true
 	rt.session.UpdatedAt = now
@@ -541,9 +542,6 @@ func (s *sessionStore) runPrompt(sessionID, content, model string, imagePaths []
 		execMu.Lock()
 		defer execMu.Unlock()
 		s.updateProviderState(sessionID, state)
-		if state.IsComplete {
-			finishSession()
-		}
 	}, func(delta string) {
 		if delta == "" {
 			return
@@ -655,6 +653,7 @@ func (s *sessionStore) appendAssistantDelta(sessionID, draftID, delta string) {
 	}
 
 	rt.session.DraftMessage.Content += delta
+	rt.session.DraftMessage.CreatedAt = time.Now()
 	rt.session.UpdatedAt = time.Now()
 	s.broadcastLocked(rt, serverEvent{Type: "message_delta", Message: cloneMessage(rt.session.DraftMessage)})
 	go func() { _ = s.persistSessions() }()
@@ -708,7 +707,9 @@ func (s *sessionStore) appendSessionEvent(sessionID string, event *Event) {
 	rt.session.Events = append(rt.session.Events, entry)
 	rt.session.UpdatedAt = entry.CreatedAt
 	s.broadcastLocked(rt, serverEvent{Type: "log", Log: cloneEvent(entry)})
-	go func() { _ = s.persistSessions() }()
+	if s.appConfig != nil && s.appConfig.PersistEvents {
+		go func() { _ = s.persistSessions() }()
+	}
 }
 
 // broadcast 按会话广播事件给所有已连接客户端。
