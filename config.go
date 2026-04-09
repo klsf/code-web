@@ -23,7 +23,6 @@ type appProviderConfig struct {
 	Models       []string `json:"models"`
 	DefaultModel string   `json:"defaultModel"`
 	Available    bool     `json:"available"`
-	IsDefault    bool     `json:"isDefault"`
 }
 
 // loadAppConfig 读取应用配置；当配置文件不存在或无效时回退到内置默认值。
@@ -64,11 +63,7 @@ func loadAppConfig() *appConfig {
 		}
 	}
 
-	defaultID := cfg.defaultProviderID()
-	for _, item := range cfg.Providers {
-		item.IsDefault = item.ID == defaultID
-	}
-	cfg.Provider = defaultID
+	cfg.Provider = cfg.defaultProviderID()
 	return cfg
 }
 
@@ -81,8 +76,8 @@ func defaultAppConfig() *appConfig {
 		Provider:      "claude",
 		PersistEvents: false,
 		Providers: []*appProviderConfig{
-			{ID: "claude", Name: "Claude", Models: []string{"sonnet", "opus", "haiku"}, DefaultModel: "sonnet", Available: true, IsDefault: true},
-			{ID: "codex", Name: "Codex", Models: []string{"gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"}, DefaultModel: "gpt-5.4", Available: true, IsDefault: false},
+			{ID: "claude", Name: "Claude", Models: []string{"sonnet", "opus", "haiku"}, DefaultModel: "sonnet", Available: true},
+			{ID: "codex", Name: "Codex", Models: []string{"gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"}, DefaultModel: "gpt-5.4", Available: true},
 		},
 	}
 }
@@ -136,7 +131,6 @@ func normalizeProviderConfig(item *appProviderConfig) *appProviderConfig {
 		Models:       models,
 		DefaultModel: defaultModel,
 		Available:    true,
-		IsDefault:    item.IsDefault,
 	}
 }
 
@@ -144,11 +138,6 @@ func normalizeProviderConfig(item *appProviderConfig) *appProviderConfig {
 func (c *appConfig) defaultProviderID() string {
 	if c == nil {
 		return "claude"
-	}
-	for _, item := range c.Providers {
-		if item != nil && item.IsDefault {
-			return item.ID
-		}
 	}
 	if text := strings.ToLower(strings.TrimSpace(c.Provider)); text != "" {
 		for _, item := range c.Providers {

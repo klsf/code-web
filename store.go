@@ -20,6 +20,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const authCookieTTL = 7 * 24 * time.Hour
+
 type sessionRuntime struct {
 	session *Session
 	clients map[*clientConn]struct{}
@@ -39,6 +41,11 @@ type sessionStore struct {
 	appConfig    *appConfig
 	authPassword string
 	authToken    string
+}
+
+var builtInProviderFactories = map[string]func() Provider{
+	"claude": func() Provider { return &ClaudeProvider{} },
+	"codex":  func() Provider { return &CodexProvider{} },
 }
 
 type restoreRef struct {
@@ -65,12 +72,25 @@ type sessionListItem struct {
 func newSessionStore() *sessionStore {
 	cfg := loadAppConfig()
 	password := strings.TrimSpace(cfg.Password)
+	providers := make(map[string]Provider, len(cfg.Providers))
+	for _, item := range cfg.Providers {
+		if item == nil {
+			continue
+		}
+		factory, ok := builtInProviderFactories[strings.ToLower(strings.TrimSpace(item.ID))]
+		if !ok {
+			continue
+		}
+		providers[item.ID] = factory()
+	}
+	if len(providers) == 0 {
+		if factory, ok := builtInProviderFactories[cfg.defaultProviderID()]; ok {
+			providers[cfg.defaultProviderID()] = factory()
+		}
+	}
 	store := &sessionStore{
-		sessions: map[string]*sessionRuntime{},
-		providers: map[string]Provider{
-			"claude": &ClaudeProvider{},
-			"codex":  &CodexProvider{},
-		},
+		sessions:     map[string]*sessionRuntime{},
+		providers:    providers,
 		appConfig:    cfg,
 		authPassword: password,
 		authToken:    authTokenForPassword(password),
@@ -128,7 +148,6 @@ func (s *sessionStore) handleAppConfig(w http.ResponseWriter, _ *http.Request) {
 			"name":         item.Name,
 			"displayName":  item.Name,
 			"available":    item.Available,
-			"isDefault":    item.IsDefault,
 			"defaultModel": item.DefaultModel,
 			"models":       append([]string(nil), item.Models...),
 		})
@@ -161,6 +180,8 @@ func (s *sessionStore) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Name:     "code_web_auth",
 		Value:    s.authToken,
 		Path:     "/",
+		MaxAge:   int(authCookieTTL / time.Second),
+		Expires:  time.Now().Add(authCookieTTL),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
@@ -789,23 +810,6 @@ func cloneSession(session *Session) *Session {
 }
 
 // cloneMessages 复制消息切片，避免历史恢复时和 provider 内存共享。
-func cloneMessages(items []*Message) []*Message {
-	out := make([]*Message, 0, len(items))
-	for _, item := range items {
-		out = append(out, cloneMessage(item))
-	}
-	return out
-}
-
-// cloneEvents 复制事件切片，避免历史恢复时和 provider 内存共享。
-func cloneEvents(items []*Event) []*Event {
-	out := make([]*Event, 0, len(items))
-	for _, item := range items {
-		out = append(out, cloneEvent(item))
-	}
-	return out
-}
-
 // cloneMessage 复制单条消息，避免共享同一块内存。
 func cloneMessage(message *Message) *Message {
 	if message == nil {
@@ -991,20 +995,15 @@ func (s *sessionStore) providerByName(name string) Provider {
 	return s.providers[key]
 }
 
-// mustProvider 获取 provider；这里用于已知存在的内置 provider。
-func (s *sessionStore) mustProvider(name string) Provider {
-	return s.providers[name]
-}
-
 // providerBySession 根据会话配置选择真正执行命令的 provider。
 func (s *sessionStore) providerBySession(session *Session) Provider {
 	if session == nil {
-		return s.mustProvider("claude")
+		return s.providerByName("")
 	}
 	if provider := s.providerByName(session.Provider); provider != nil {
 		return provider
 	}
-	return s.mustProvider("claude")
+	return s.providerByName("")
 }
 
 // defaultProviderID 返回当前应用配置中的默认 provider。

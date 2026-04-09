@@ -1,10 +1,10 @@
+code-web.exe
 code-web
-code-web-linux-amd64
-*.exe
-*.exe~
 
 .idea/
 .vscode/
 
 /data/uploads/*
 /data/sessions/*
+
+web/node_modules

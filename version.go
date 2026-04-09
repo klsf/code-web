@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-const defaultAppVersion = "1.2.0"
+const defaultAppVersion = "1.2.2"
 
 // appVersion 返回当前服务应暴露给前端的版本号。
 func appVersion() string {

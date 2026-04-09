@@ -1,0 +1,8 @@
+{
+  "name": "code-web-ui",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix web run dev",
+    "build": "npm --prefix web run build"
+  }
+}

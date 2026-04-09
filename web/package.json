@@ -1,0 +1,30 @@
+{
+  "name": "code-web",
+  "version": "1.2.2",
+  "description": "<p align=\"right\">   中文 | <a href=\"./README.en.md\">English</a> </p>",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/klsf/code-web.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/klsf/code-web/issues"
+  },
+  "homepage": "https://github.com/klsf/code-web#readme",
+  "dependencies": {
+    "dompurify": "^3.3.0",
+    "markdown-it": "^14.1.0",
+    "vue": "^3.5.22"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.5",
+    "vite": "^8.0.7"
+  }
+}

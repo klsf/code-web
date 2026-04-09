@@ -6,7 +6,7 @@
 
 <p align="center">
   <img alt="Go Version" src="https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-v1.2.1-111827">
+  <img alt="Version" src="https://img.shields.io/badge/version-v1.2.2-111827">
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/klsf/code-web?style=social">
 </p>
 `Code Web` 是一个基于 `Go + HTML + WebSocket` 构建的代码助手 Web UI，目前支持 `Codex` 和 `Claude`。
