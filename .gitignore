@@ -3,8 +3,10 @@ code-web
 
 .idea/
 .vscode/
+.codex/
 
 /data/uploads/*
 /data/sessions/*
 
 web/node_modules
+AGENTS.md

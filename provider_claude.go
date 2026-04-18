@@ -22,6 +22,18 @@ type claudeStreamPayload struct {
 	Result    string `json:"result"`
 	IsError   bool   `json:"is_error"`
 	Error     string `json:"error"`
+	Event     struct {
+		Type  string `json:"type"`
+		Index int    `json:"index"`
+		Delta struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"delta"`
+		ContentBlock struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content_block"`
+	} `json:"event"`
 	Message   struct {
 		Content []struct {
 			Type string `json:"type"`
@@ -112,6 +124,7 @@ func (p *ClaudeProvider) Exec(ctx context.Context, session *Session, prompt stri
 		"-p", strings.TrimSpace(prompt),
 		"--verbose",
 		"--output-format", "stream-json",
+		"--include-partial-messages",
 		"--dangerously-skip-permissions",
 		"--model", func(value, fallback string) string {
 			if strings.TrimSpace(value) != "" {
@@ -228,6 +241,34 @@ func (p *ClaudeProvider) parseClaudeEventLine(line string) *Event {
 	if err := json.Unmarshal([]byte(line), &payload); err != nil {
 		return nil
 	}
+	payloadType := strings.ToLower(strings.TrimSpace(anyString(payload["type"])))
+
+	if payloadType == "user" {
+		message, _ := payload["message"].(map[string]any)
+		content, _ := message["content"].([]any)
+		for _, item := range content {
+			block, _ := item.(map[string]any)
+			if strings.ToLower(strings.TrimSpace(anyString(block["type"]))) != "tool_result" {
+				continue
+			}
+			target, body, title, stepType := summarizeClaudeToolResult(payload["tool_use_result"], block)
+			if target == "" && body == "" {
+				continue
+			}
+			return &Event{
+				ID:        newUUID(),
+				Kind:      "status",
+				Category:  "step",
+				StepType:  stepType,
+				Phase:     "completed",
+				Title:     title,
+				Body:      body,
+				Target:    target,
+				MergeKey:  anyString(block["tool_use_id"]),
+				CreatedAt: time.Now(),
+			}
+		}
+	}
 
 	message, _ := payload["message"].(map[string]any)
 	content, _ := message["content"].([]any)
@@ -237,21 +278,76 @@ func (p *ClaudeProvider) parseClaudeEventLine(line string) *Event {
 			continue
 		}
 		name := anyString(block["name"])
-		body := stringifyJSON(block["input"])
+		callID := anyString(block["id"])
+		input := block["input"]
+		stepType := normalizeStepType(name)
+		target := extractEventTarget(input)
+		body := compactEventBody(stringifyJSON(input))
+		title := eventTitleForAction(name)
+
+		switch stepType {
+		case "taskupdate":
+			stepType = "todo_list"
+			title = "todo list"
+			body = compactEventBody(formatClaudeTaskUpdateBody(input))
+		case "taskcreate":
+			stepType = "todo_list"
+			title = "新增任务"
+			body = compactEventBody(formatClaudeTaskCreateBody(input))
+		case "tasklist":
+			stepType = "todo_list"
+			title = "任务列表"
+		case "taskget":
+			stepType = "todo_list"
+			title = "查看任务"
+		case "edit", "write", "multiedit":
+			stepType = "file_change"
+			title = "修改文件"
+			target = firstNonEmptyString(
+				extractEventTargetMap(input, "file_path", "path"),
+				target,
+			)
+		case "read":
+			title = "读取文件"
+			target = firstNonEmptyString(
+				extractEventTargetMap(input, "file_path", "path"),
+				target,
+			)
+		case "grep", "glob":
+			title = "检索内容"
+		case "bash":
+			stepType = "command_execution"
+			title = "执行命令"
+			target = firstNonEmptyString(
+				extractEventTargetMap(input, "command", "cmd"),
+				target,
+			)
+		case "agent":
+			title = "委派任务"
+		case "askuserquestion":
+			title = "请求用户输入"
+		case "enterplanmode":
+			stepType = "todo_list"
+			title = "进入计划模式"
+		case "exitplanmode":
+			stepType = "todo_list"
+			title = "退出计划模式"
+		}
+
 		return &Event{
 			ID:        newUUID(),
 			Kind:      "command",
 			Category:  "command",
-			StepType:  normalizeStepType(name),
+			StepType:  stepType,
 			Phase:     "started",
-			Title:     "调用工具 " + firstNonEmptyString(name, "tool"),
+			Title:     title,
 			Body:      body,
-			Target:    name,
+			Target:    target,
+			MergeKey:  callID,
 			CreatedAt: time.Now(),
 		}
 	}
 
-	payloadType := strings.ToLower(strings.TrimSpace(anyString(payload["type"])))
 	if payloadType == "result" {
 		return &Event{
 			ID:        newUUID(),
@@ -267,6 +363,113 @@ func (p *ClaudeProvider) parseClaudeEventLine(line string) *Event {
 	return nil
 }
 
+func summarizeClaudeToolResult(result any, block map[string]any) (target, body, title, stepType string) {
+	title = "工具结果"
+	stepType = "tool_result"
+	body = compactEventBody(anyString(block["content"]))
+	if isError, ok := block["is_error"].(bool); ok && isError {
+		title = "工具报错"
+	}
+
+	node, _ := result.(map[string]any)
+	if len(node) == 0 {
+		return strings.TrimSpace(target), strings.TrimSpace(body), title, stepType
+	}
+
+	if fileNode, ok := node["file"].(map[string]any); ok {
+		stepType = "read_result"
+		title = "读取结果"
+		target = firstNonEmptyString(
+			extractEventTarget(fileNode["filePath"]),
+			extractEventTarget(fileNode["file_path"]),
+		)
+		if body == "" {
+			body = compactEventBody(firstNonEmptyString(
+				anyString(fileNode["content"]),
+				stringifyJSON(fileNode),
+			))
+		}
+		return strings.TrimSpace(target), strings.TrimSpace(body), title, stepType
+	}
+
+	if filenames, ok := node["filenames"].([]any); ok {
+		stepType = "search_result"
+		title = "检索结果"
+		target = extractEventTarget(filenames)
+		if body == "" {
+			body = compactEventBody(stringifyJSON(filenames))
+		}
+		return strings.TrimSpace(target), strings.TrimSpace(body), title, stepType
+	}
+
+	stdout := strings.TrimSpace(anyString(node["stdout"]))
+	stderr := strings.TrimSpace(anyString(node["stderr"]))
+	if stdout != "" || stderr != "" {
+		stepType = "command_result"
+		title = "命令结果"
+		body = compactEventBody(firstNonEmptyString(stdout, stderr))
+		return strings.TrimSpace(target), strings.TrimSpace(body), title, stepType
+	}
+
+	target = extractEventTarget(node)
+	if body == "" {
+		body = compactEventBody(stringifyJSON(node))
+	}
+	return strings.TrimSpace(target), strings.TrimSpace(body), title, stepType
+}
+
+func extractEventTargetMap(value any, keys ...string) string {
+	node, _ := value.(map[string]any)
+	if len(node) == 0 {
+		return ""
+	}
+	for _, key := range keys {
+		if target := extractEventTarget(node[key]); target != "" {
+			return target
+		}
+	}
+	return ""
+}
+
+func formatClaudeTaskUpdateBody(value any) string {
+	node, _ := value.(map[string]any)
+	if len(node) == 0 {
+		return stringifyJSON(value)
+	}
+	var parts []string
+	if taskID := strings.TrimSpace(anyString(node["task_id"])); taskID != "" {
+		parts = append(parts, "任务 "+taskID)
+	}
+	if status := strings.TrimSpace(anyString(node["status"])); status != "" {
+		parts = append(parts, "状态: "+status)
+	}
+	if content := strings.TrimSpace(firstNonEmptyString(anyString(node["description"]), anyString(node["title"]), anyString(node["message"]))); content != "" {
+		parts = append(parts, content)
+	}
+	if len(parts) == 0 {
+		return stringifyJSON(value)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func formatClaudeTaskCreateBody(value any) string {
+	node, _ := value.(map[string]any)
+	if len(node) == 0 {
+		return stringifyJSON(value)
+	}
+	var parts []string
+	if title := strings.TrimSpace(firstNonEmptyString(anyString(node["title"]), anyString(node["description"]), anyString(node["message"]))); title != "" {
+		parts = append(parts, title)
+	}
+	if status := strings.TrimSpace(anyString(node["status"])); status != "" {
+		parts = append(parts, "状态: "+status)
+	}
+	if len(parts) == 0 {
+		return stringifyJSON(value)
+	}
+	return strings.Join(parts, "\n")
+}
+
 func (p *ClaudeProvider) parseClaudeStreamLine(line string) (text string, errText string, providerSessionID string) {
 	var payload claudeStreamPayload
 	if err := json.Unmarshal([]byte(line), &payload); err != nil {
@@ -278,6 +481,20 @@ func (p *ClaudeProvider) parseClaudeStreamLine(line string) (text string, errTex
 	}
 	if payload.IsError && errText == "" {
 		errText = strings.TrimSpace(payload.Result)
+	}
+	if strings.EqualFold(payload.Type, "stream_event") {
+		eventType := strings.ToLower(strings.TrimSpace(payload.Event.Type))
+		if eventType == "content_block_delta" && strings.EqualFold(strings.TrimSpace(payload.Event.Delta.Type), "text_delta") {
+			if text := payload.Event.Delta.Text; text != "" {
+				return text, errText, providerSessionID
+			}
+		}
+		if eventType == "content_block_start" && strings.EqualFold(strings.TrimSpace(payload.Event.ContentBlock.Type), "text") {
+			if text := payload.Event.ContentBlock.Text; text != "" {
+				return text, errText, providerSessionID
+			}
+		}
+		return "", errText, providerSessionID
 	}
 	var chunks []string
 	for _, item := range payload.Message.Content {

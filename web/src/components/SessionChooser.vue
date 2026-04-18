@@ -15,7 +15,6 @@ const emit = defineEmits(["update:provider", "update:workdir", "create", "resume
 <template>
   <section class="overlay-screen">
     <div class="auth-card chooser-card">
-      <div class="brand-mark">CW</div>
       <h1>{{ appName }}</h1>
       <p>{{ version }}</p>
       <div class="provider-grid">

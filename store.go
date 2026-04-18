@@ -725,12 +725,67 @@ func (s *sessionStore) appendSessionEvent(sessionID string, event *Event) {
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now()
 	}
+	if mergeSessionEvent(rt.session, entry) {
+		rt.session.UpdatedAt = time.Now()
+		s.broadcastLocked(rt, serverEvent{Type: "snapshot", Session: cloneSession(rt.session), Running: rt.session.IsRunning})
+		if s.appConfig != nil && s.appConfig.PersistEvents {
+			go func() { _ = s.persistSessions() }()
+		}
+		return
+	}
 	rt.session.Events = append(rt.session.Events, entry)
 	rt.session.UpdatedAt = entry.CreatedAt
 	s.broadcastLocked(rt, serverEvent{Type: "log", Log: cloneEvent(entry)})
 	if s.appConfig != nil && s.appConfig.PersistEvents {
 		go func() { _ = s.persistSessions() }()
 	}
+}
+
+func mergeSessionEvent(session *Session, incoming *Event) bool {
+	if session == nil || incoming == nil {
+		return false
+	}
+	key := strings.TrimSpace(incoming.MergeKey)
+	if key == "" || strings.ToLower(strings.TrimSpace(incoming.Phase)) != "completed" {
+		return false
+	}
+	for i := len(session.Events) - 1; i >= 0; i-- {
+		current := session.Events[i]
+		if current == nil || strings.TrimSpace(current.MergeKey) != key {
+			continue
+		}
+		if strings.TrimSpace(current.Target) == "" {
+			current.Target = incoming.Target
+		}
+		if strings.TrimSpace(incoming.Title) != "" {
+			current.Title = incoming.Title
+		}
+		if strings.TrimSpace(incoming.StepType) != "" {
+			current.StepType = incoming.StepType
+		}
+		if strings.TrimSpace(incoming.Kind) != "" {
+			current.Kind = incoming.Kind
+		}
+		if strings.TrimSpace(incoming.Category) != "" {
+			current.Category = incoming.Category
+		}
+		if strings.TrimSpace(incoming.Body) != "" {
+			switch {
+			case strings.TrimSpace(current.Body) == "":
+				current.Body = incoming.Body
+			case !strings.Contains(current.Body, incoming.Body):
+				current.Body = strings.TrimSpace(current.Body) + "\n\n结果:\n" + strings.TrimSpace(incoming.Body)
+			}
+		}
+		if strings.TrimSpace(incoming.Phase) != "" {
+			current.Phase = incoming.Phase
+		}
+		if current.CreatedAt.Before(incoming.CreatedAt) {
+			current.CreatedAt = incoming.CreatedAt
+		}
+		return true
+	}
+	return false
 }
 
 // broadcast 按会话广播事件给所有已连接客户端。

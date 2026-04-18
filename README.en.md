@@ -6,7 +6,7 @@
 
 <p align="center">
   <img alt="Go Version" src="https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white">
-  <img alt="Version" src="https://img.shields.io/badge/version-v1.2.2-111827">
+  <img alt="Version" src="https://img.shields.io/badge/version-v1.2.3-111827">
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/klsf/code-web?style=social">
 </p>
 
@@ -143,3 +143,4 @@ location / {
 ## License
 
 This project is licensed under `MIT`. See [LICENSE](./LICENSE).
+

@@ -12,7 +12,6 @@ const emit = defineEmits(["update:password", "submit"]);
 <template>
   <section class="overlay-screen">
     <form class="auth-card" @submit.prevent="emit('submit')">
-      <div class="brand-mark">CW</div>
       <h1>{{ appName }}</h1>
       <p>{{ version }}</p>
       <input class="visually-hidden" type="text" name="username" autocomplete="username" />

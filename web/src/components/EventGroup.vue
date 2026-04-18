@@ -1,5 +1,5 @@
 <script setup>
-import { eventDetailBody, eventTitleText, iconMap } from "../lib/chat-helpers.js";
+import { eventDetailSections, eventTitleText, iconMap } from "../lib/chat-helpers.js";
 
 defineProps({
   item: Object,
@@ -57,7 +57,17 @@ defineProps({
           <div v-if="selectedEventId(item) === event.id" class="event-detail-panel">
             <div class="event-detail-title">{{ eventTitleText(event) }}</div>
             <div class="event-detail-meta">{{ event.meta }}</div>
-            <pre class="event-detail-body">{{ eventDetailBody(event) || event.summary }}</pre>
+            <div class="event-detail-sections">
+              <section
+                v-for="(section, index) in eventDetailSections(event)"
+                :key="`${event.id}-section-${index}`"
+                class="event-detail-section"
+                :class="`tone-${section.tone}`"
+              >
+                <div class="event-detail-section-label">{{ section.label }}</div>
+                <pre class="event-detail-body">{{ section.value }}</pre>
+              </section>
+            </div>
           </div>
         </div>
       </div>

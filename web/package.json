@@ -1,6 +1,6 @@
 {
   "name": "code-web",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "<p align=\"right\">   中文 | <a href=\"./README.en.md\">English</a> </p>",
   "scripts": {
     "dev": "vite",
@@ -28,3 +28,4 @@
     "vite": "^8.0.7"
   }
 }
+

@@ -47,6 +47,20 @@ export function useChatApp() {
   let wsIntentionalClose = false;
   let errorToastTimer = null;
 
+  function scrollTimelineToBottom() {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const timelineNode = document.querySelector(".timeline-panel");
+        if (timelineNode && timelineNode.scrollHeight > timelineNode.clientHeight) {
+          timelineNode.scrollTop = timelineNode.scrollHeight;
+        }
+        const root = document.scrollingElement || document.documentElement || document.body;
+        if (root) root.scrollTop = root.scrollHeight;
+        window.scrollTo(0, document.body.scrollHeight);
+      });
+    });
+  }
+
   function appConfig() {
     return window.__APP_CONFIG || {};
   }
@@ -152,10 +166,14 @@ export function useChatApp() {
   watch(
     () => `${mergedTimeline.value.length}:${state.timelineStamp}`,
     () => {
-      requestAnimationFrame(() => {
-        const timelineNode = document.querySelector(".timeline-panel");
-        if (timelineNode) timelineNode.scrollTop = timelineNode.scrollHeight;
-      });
+      scrollTimelineToBottom();
+    }
+  );
+
+  watch(
+    () => state.screen,
+    (value) => {
+      if (value === "chat") scrollTimelineToBottom();
     }
   );
 
@@ -187,9 +205,11 @@ export function useChatApp() {
   }
 
   function setTaskState(running) {
+    const wasRunning = state.running;
     state.running = Boolean(running);
     if (state.running) setFooterStatus("Working", `${selectedProvider.value} 正在生成`);
     else if (state.transportState === "connected") setFooterStatus("Ready", "等待输入");
+    if (wasRunning && !state.running) scrollTimelineToBottom();
   }
 
   function setSession(id) {
@@ -357,6 +377,7 @@ export function useChatApp() {
         setMeta({ provider: data.session.provider, model: data.session.model, cwd: data.session.workdir });
         replaceTimeline(data.session.messages || [], data.session.events || [], data.session.draftMessage || null);
         setTaskState(Boolean(data.running));
+        scrollTimelineToBottom();
         return;
       }
       if (data.type === "message" && data.message) {
@@ -375,6 +396,7 @@ export function useChatApp() {
         state.messages = state.messages.filter((item) => item.id !== data.message.id).concat(data.message);
         setFooterStatus("Ready", "本轮回复已完成");
         state.timelineStamp += 1;
+        scrollTimelineToBottom();
         return;
       }
       if (data.type === "log" && data.log) {
@@ -389,6 +411,7 @@ export function useChatApp() {
       if (data.type === "error" && data.error) {
         setTaskState(false);
         showError(data.error);
+        scrollTimelineToBottom();
       }
     });
 
@@ -449,7 +472,7 @@ export function useChatApp() {
   }
 
   function groupPreviewIcons(group) {
-    return group.events.slice(0, 3);
+    return group.events.slice(0, 8);
   }
 
   function isGroupExpanded(group) {

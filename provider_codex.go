@@ -277,6 +277,51 @@ func (p *CodexProvider) parseCodexEventLine(line string) *Event {
 				CreatedAt: time.Now(),
 			}
 		}
+		if eventType == "exec_command_end" {
+			target := extractEventTarget(eventPayload["parsed_cmd"])
+			if target == "" {
+				target = extractEventTarget(eventPayload["command"])
+			}
+			body := compactEventBody(anyString(eventPayload["aggregated_output"]))
+			return &Event{
+				ID:        newUUID(),
+				Kind:      "command",
+				Category:  "command",
+				StepType:  "shell_command",
+				Phase:     firstNonEmptyString(anyString(eventPayload["status"]), "completed"),
+				Title:     "执行命令",
+				Body:      body,
+				Target:    target,
+				MergeKey:  firstNonEmptyString(anyString(eventPayload["id"]), anyString(eventPayload["call_id"])),
+				CreatedAt: time.Now(),
+			}
+		}
+		if eventType == "mcp_tool_call_end" {
+			invocation, _ := eventPayload["invocation"].(map[string]any)
+			server := anyString(invocation["server"])
+			tool := anyString(invocation["tool"])
+			target := extractEventTarget(invocation["arguments"])
+			resultTarget := extractEventTarget(eventPayload["result"])
+			if target == "" {
+				target = resultTarget
+			}
+			body := compactEventBody(stringifyJSON(invocation["arguments"]))
+			if body == "" {
+				body = compactEventBody(stringifyJSON(eventPayload["result"]))
+			}
+			rawName := firstNonEmptyString(strings.Trim(strings.Join([]string{server, tool}, "_"), "_"), tool, server)
+			return &Event{
+				ID:        newUUID(),
+				Kind:      "command",
+				Category:  "command",
+				StepType:  normalizeStepType(rawName),
+				Phase:     "completed",
+				Title:     eventTitleForAction(rawName),
+				Body:      body,
+				Target:    target,
+				CreatedAt: time.Now(),
+			}
+		}
 		return nil
 	}
 	if topType == "response_item" {
@@ -296,6 +341,93 @@ func (p *CodexProvider) parseCodexEventLine(line string) *Event {
 				Phase:     "started",
 				Title:     "todo list",
 				Body:      body,
+				MergeKey:  anyString(responsePayload["call_id"]),
+				CreatedAt: time.Now(),
+			}
+		}
+		if responseType == "function_call" {
+			rawName := firstNonEmptyString(
+				strings.Trim(strings.Join([]string{anyString(responsePayload["namespace"]), anyString(responsePayload["name"])}, "_"), "_"),
+				anyString(responsePayload["name"]),
+				anyString(responsePayload["namespace"]),
+			)
+			target := extractEventTarget(anyString(responsePayload["arguments"]))
+			body := compactEventBody(anyString(responsePayload["arguments"]))
+			if target == "" && body == "" {
+				return nil
+			}
+			return &Event{
+				ID:        newUUID(),
+				Kind:      "command",
+				Category:  "command",
+				StepType:  normalizeStepType(rawName),
+				Phase:     "started",
+				Title:     eventTitleForAction(rawName),
+				Body:      body,
+				Target:    target,
+				MergeKey:  anyString(responsePayload["call_id"]),
+				CreatedAt: time.Now(),
+			}
+		}
+		if responseType == "custom_tool_call" {
+			rawName := firstNonEmptyString(anyString(responsePayload["name"]), responseType)
+			input := anyString(responsePayload["input"])
+			target := ""
+			if normalizeStepType(rawName) == "apply_patch" {
+				target = extractPatchTargets(input)
+			}
+			if target == "" {
+				target = extractEventTarget(input)
+			}
+			body := compactEventBody(input)
+			stepType := normalizeStepType(rawName)
+			if stepType == "apply_patch" {
+				stepType = "file_change"
+			}
+			if target == "" && body == "" {
+				return nil
+			}
+			return &Event{
+				ID:        newUUID(),
+				Kind:      "command",
+				Category:  "step",
+				StepType:  stepType,
+				Phase:     firstNonEmptyString(anyString(responsePayload["status"]), "completed"),
+				Title:     eventTitleForAction(stepType),
+				Body:      body,
+				Target:    target,
+				MergeKey:  anyString(responsePayload["call_id"]),
+				CreatedAt: time.Now(),
+			}
+		}
+		if responseType == "web_search_call" {
+			action, _ := responsePayload["action"].(map[string]any)
+			actionType := strings.ToLower(strings.TrimSpace(anyString(action["type"])))
+			rawName := "web_search"
+			if actionType != "" {
+				rawName = "web_search_" + actionType
+			}
+			target := firstNonEmptyString(
+				extractEventTarget(action["query"]),
+				extractEventTarget(action["url"]),
+				extractEventTarget(action["queries"]),
+				extractEventTarget(action),
+			)
+			body := compactEventBody(stringifyJSON(action))
+			title := "检索内容"
+			if actionType == "open_page" {
+				title = "访问网页"
+			}
+			return &Event{
+				ID:        newUUID(),
+				Kind:      "command",
+				Category:  "command",
+				StepType:  normalizeStepType(rawName),
+				Phase:     firstNonEmptyString(anyString(responsePayload["status"]), "completed"),
+				Title:     title,
+				Body:      body,
+				Target:    target,
+				MergeKey:  anyString(responsePayload["call_id"]),
 				CreatedAt: time.Now(),
 			}
 		}
@@ -319,49 +451,62 @@ func (p *CodexProvider) parseCodexEventLine(line string) *Event {
 	}
 
 	title := p.humanizeStepLabel(itemType)
-	body := compactEventBody(p.joinEventText(anyString(item["text"]), stringifyJSON(item["content"])))
-	target := firstNonEmptyString(anyString(item["command"]), anyString(item["path"]), anyString(item["name"]))
+	action, _ := item["action"].(map[string]any)
+	actionType := strings.ToLower(strings.TrimSpace(anyString(action["type"])))
+	if itemType == "web_search" && actionType == "open_page" {
+		title = "访问网页"
+	}
+	body := compactEventBody(p.joinEventText(
+		anyString(item["text"]),
+		anyString(item["query"]),
+		anyString(item["message"]),
+		stringifyJSON(item["changes"]),
+		stringifyJSON(item["action"]),
+		stringifyJSON(item["arguments"]),
+		stringifyJSON(item["content"]),
+	))
+	target := firstNonEmptyString(
+		extractPatchTargets(anyString(item["input"])),
+		extractPatchTargets(anyString(item["changes"])),
+		extractEventTarget(item["query"]),
+		extractEventTarget(item["action"]),
+		extractEventTarget(item["url"]),
+		extractEventTarget(item["input"]),
+		extractEventTarget(item["changes"]),
+		extractEventTarget(item["arguments"]),
+		extractEventTarget(item["command"]),
+		extractEventTarget(item["path"]),
+		extractEventTarget(item["name"]),
+		extractEventTarget(item["content"]),
+		extractEventTarget(item["text"]),
+	)
 	if body == "" && target == "" && (strings.Contains(itemType, "delta") || strings.Contains(itemType, "message")) {
 		return nil
+	}
+	phase := p.eventPhaseForStep(itemType)
+	switch topType {
+	case "item.started":
+		phase = "started"
+	case "item.completed":
+		phase = "completed"
 	}
 	return &Event{
 		ID:        newUUID(),
 		Kind:      p.eventKindForStep(itemType),
 		Category:  "step",
 		StepType:  normalizeStepType(itemType),
-		Phase:     p.eventPhaseForStep(itemType),
+		Phase:     phase,
 		Title:     title,
 		Body:      body,
 		Target:    target,
+		MergeKey:  anyString(item["id"]),
 		CreatedAt: time.Now(),
 	}
 }
 
 // humanizeStepLabel 把 Codex 事件类型转换成更适合前端展示的中文标题。
 func (p *CodexProvider) humanizeStepLabel(stepType string) string {
-	text := normalizeStepType(stepType)
-	switch text {
-	case "reasoning":
-		return "思考中"
-	case "thread", "turn":
-		return text
-	case "shellcommand", "shell_command", "exec_command_begin", "exec_command":
-		return "执行命令"
-	case "readfile", "read_file":
-		return "读取文件"
-	case "writefile", "write_file":
-		return "写入文件"
-	case "editfile", "patchfile", "apply_patch", "patch_file":
-		return "修改文件"
-	case "searchfiles", "findfiles", "glob", "grep", "search_text":
-		return "检索内容"
-	case "openurl", "fetchurl", "web_search":
-		return "访问网页"
-	case "tool_call", "tool_use", "function_call":
-		return "调用工具"
-	default:
-		return strings.ReplaceAll(text, "_", " ")
-	}
+	return eventTitleForAction(stepType)
 }
 
 // eventKindForStep 根据 Codex 事件类型推断前端展示的事件种类。

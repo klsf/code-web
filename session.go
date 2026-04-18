@@ -32,6 +32,8 @@ type Event struct {
 	Body string `json:"body,omitempty"`
 	// Target 表示这次步骤操作的目标对象，例如文件路径或命令名。
 	Target string `json:"target,omitempty"`
+	// MergeKey 用于把同一次工具调用的 started/completed 合并成同一条事件。
+	MergeKey string `json:"mergeKey,omitempty"`
 	// CreatedAt 是事件创建时间。
 	CreatedAt time.Time `json:"createdAt"`
 }
